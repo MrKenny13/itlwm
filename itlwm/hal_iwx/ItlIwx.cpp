@@ -8899,13 +8899,24 @@ iwx_mac_ctxt_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action,
 
     if (sc->sc_awdl_cell) {
         /*
-         * itlawdl v2: the cell's RX filters. No promisc: the peer's
-         * frames are on our own BSSID already, so they come up as
-         * intra-BSS traffic; control and mgmt are passed to the host,
-         * foreign beacons and probe requests too. No IN_CRC32: frames
-         * are delivered without FCS, ready for the userspace engine.
+         * itlawdl v2.1: the cell's RX filters. v2 shipped without
+         * PROMISC on the theory that the peer's broadcast frames on our
+         * own BSSID would come up as intra-BSS traffic -- they do not:
+         * a capture of a live iPhone shows every AWDL frame (action/
+         * PSF, mDNS data) is broadcast with addr3 = the AWDL BSSID,
+         * and the firmware in IBSS mode still delivers none of them
+         * (rx stays 0 while the same frames flow in LISTENER mode).
+         * The peer never beacons on the AWDL BSSID, so the firmware
+         * never learns it as a BSS member; PROMISC hands us every
+         * frame regardless, which the userspace engine needs. ACKing
+         * is unaffected: that is TX-side firmware behaviour for
+         * unicast frames on the context's BSSID (owly's cell ACKs on
+         * Linux with the same card). Control and mgmt, foreign beacons
+         * and probe requests keep coming too. No IN_CRC32: frames are
+         * delivered without FCS, ready for the userspace engine.
          */
-        cmd.filter_flags |= htole32(IWX_MAC_FILTER_IN_CONTROL_AND_MGMT |
+        cmd.filter_flags |= htole32(IWX_MAC_FILTER_IN_PROMISC |
+                                    IWX_MAC_FILTER_IN_CONTROL_AND_MGMT |
                                     IWX_MAC_FILTER_IN_BEACON |
                                     IWX_MAC_FILTER_IN_PROBE_REQUEST |
                                     IWX_MAC_FILTER_ACCEPT_GRP);
