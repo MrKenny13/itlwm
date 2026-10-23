@@ -110,6 +110,7 @@
 #include "../../AirportItlwm/WCL/WCL.hpp"
 #endif
 #include "ItlIwx.hpp"
+#include "AwdlProbe.hpp"
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <FwData.h>
@@ -157,12 +158,14 @@ bool ItlIwx::attach(IOPCIDevice *device)
         releaseAll();
         return false;
     }
+    awdl_probe_attach(this);
     return true;
 }
 
 void ItlIwx::
 detach(IOPCIDevice *device)
 {
+    awdl_probe_detach(this);
 #ifdef AIRPORT_VTD
     getMainCommandGate()->runAction(
         [](OSObject *, void *arg0, void *arg1, void *, void *) -> IOReturn {
@@ -260,6 +263,9 @@ getDriverController()
 IOReturn ItlIwx::enable(IONetworkInterface *netif)
 {
     XYLog("%s\n", __PRETTY_FUNCTION__);
+    /* Wi-Fi coming back while the AWDL probe listens: give the card back first. */
+    if (gAwdl.active && !gAwdl.entering)
+        awdlProbeLeaveGated();
     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
     if (ifp->if_flags & IFF_UP) {
         XYLog("%s already in activating state\n", __FUNCTION__);
@@ -282,6 +288,76 @@ IOReturn ItlIwx::disable(IONetworkInterface *netif)
     ifp->if_flags &= ~IFF_UP;
     iwx_activate(&com, DVACT_QUIESCE);
     return kIOReturnSuccess;
+}
+
+int ItlIwx::
+awdlProbeSet(int want)
+{
+    IOReturn ret = getMainCommandGate()->runAction(
+        [](OSObject *, void *arg0, void *arg1, void *, void *) -> IOReturn {
+            ItlIwx *that = (ItlIwx *)arg0;
+            return (IOReturn)that->awdlProbeSetGated((int)(uintptr_t)arg1);
+        }, this, (void *)(uintptr_t)want);
+    return (int)ret;
+}
+
+void ItlIwx::
+awdlProbeStop()
+{
+    if (!gAwdl.active)
+        return;
+    getMainCommandGate()->runAction(
+        [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+            ((ItlIwx *)arg0)->awdlProbeLeaveGated();
+            return kIOReturnSuccess;
+        }, this);
+    gAwdl.state = AWDL_STATE_OFF;
+}
+
+/* In the gate. */
+int ItlIwx::
+awdlProbeSetGated(int want)
+{
+    struct ieee80211com *ic = &com.sc_ic;
+    struct _ifnet *ifp = &ic->ic_ac.ac_if;
+
+    if (!want) {
+        awdlProbeLeaveGated();
+        return AWDL_STATE_OFF;
+    }
+    if (gAwdl.active)
+        return AWDL_STATE_LISTENING;
+    if (ifp->if_flags & (IFF_UP | IFF_RUNNING)) {
+        XYLog("%s: AWDL probe refused: turn Wi-Fi off first\n", __FUNCTION__);
+        return AWDL_STATE_BUSY_WIFI_ON;
+    }
+    if (isclr(ic->ic_chan_active, AWDL_PROBE_CHANNEL)) {
+        XYLog("%s: AWDL probe: channel %d not usable\n", __FUNCTION__, AWDL_PROBE_CHANNEL);
+        return AWDL_STATE_FAILED;
+    }
+
+    awdl_probe_reset_counters();
+    ic->ic_opmode = IEEE80211_M_MONITOR;
+    ic->ic_ibss_chan = &ic->ic_channels[AWDL_PROBE_CHANNEL];
+    gAwdl.active = 1;
+    gAwdl.entering = 1;
+    enable(NULL);
+    gAwdl.entering = 0;
+    XYLog("%s: AWDL probe listening on channel %d\n", __FUNCTION__, AWDL_PROBE_CHANNEL);
+    return AWDL_STATE_LISTENING;
+}
+
+/* In the gate. */
+void ItlIwx::
+awdlProbeLeaveGated()
+{
+    if (!gAwdl.active)
+        return;
+    gAwdl.active = 0;
+    disable(NULL);
+    com.sc_ic.ic_opmode = IEEE80211_M_STA;
+    gAwdl.state = AWDL_STATE_OFF;
+    XYLog("%s: AWDL probe stopped, station mode restored\n", __FUNCTION__);
 }
 
 void ItlIwx::
@@ -5361,6 +5437,8 @@ iwx_rx_frame(struct iwx_softc *sc, mbuf_t m, int chanidx,
         chanidx = ieee80211_chan2ieee(ic, ic->ic_ibss_chan);
     
     wh = mtod(m, struct ieee80211_frame *);
+    if (gAwdl.active)
+        awdl_probe_rx(mtod(m, const uint8_t *), mbuf_len(m), rxi->rxi_rssi, chanidx);
     ni = ieee80211_find_rxnode(ic, wh);
     if ((rxi->rxi_flags & IEEE80211_RXI_HWDEC) &&
         iwx_ccmp_decap(sc, m, ni, rxi) != 0) {

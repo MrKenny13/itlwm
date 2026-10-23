@@ -166,6 +166,14 @@ public:
     virtual ItlDriverInfo *getDriverInfo() override;
     
     virtual ItlDriverController *getDriverController() override;
+
+    /* AWDL listen probe (AwdlProbe.hpp) */
+    int awdlProbeSet(int want);
+    void awdlProbeStop() override;
+private:
+    int awdlProbeSetGated(int want);
+    void awdlProbeLeaveGated();
+public:
     
     //driver info
     virtual const char *getFirmwareVersion() override;
