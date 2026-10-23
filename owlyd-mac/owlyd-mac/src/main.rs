@@ -106,7 +106,7 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
     };
 
     let (peers_tx, peers_rx) = watch::channel(Vec::<PeerInfo>::new());
-    let running = owly_awdl::driver::spawn(cfg, move || Ok((KextAir::new(), utun.register()?)), peers_tx)
+    let running = owly_awdl::driver::spawn(cfg, move || Ok((KextAir::new()?, utun.register()?)), peers_tx)
         .map_err(|e| io::Error::other(format!("le moteur AWDL n'a pas démarré : {e}")))?;
     println!("== moteur AWDL lancé (canal {CHANNEL}, présence fixe). Ctrl-C pour arrêter.\n");
 
@@ -115,6 +115,10 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
     rt.block_on(monitor(peers_rx, failed));
     println!("\n== arrêt…");
     running.stop();
+    // Give the kext's reader thread a beat to see the channel close and
+    // leave the sysctl alone before the session -- and its ring with it
+    // -- goes away.
+    std::thread::sleep(Duration::from_millis(50));
     session_down();
     wifi.on();
     println!("== session arrêtée, Wi-Fi rendu. À la prochaine.");

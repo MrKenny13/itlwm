@@ -22,8 +22,11 @@ branch awdl-v2) loaded, and nothing else holding the radio.
 
 ## Layout
 
-    vendor/owly-awdl   owly's sans-IO AWDL crate, unmodified (MIT)
-    owlyd-mac          the daemon: sysctl bindings, the Air, the utun Netif
+    vendor/owly-awdl   owly's sans-IO AWDL crate (MIT); one documented
+                       deviation: Running::stop waits at most 2 s
+    owlyd-mac          the daemon: sysctl bindings, the Air (a reader
+                       thread over the kext's RX ring + inline inject),
+                       the utun Netif
 
 ## Credits
 

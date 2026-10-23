@@ -36,6 +36,13 @@ const RETRY_US: u64 = 100_000;
 /// How soon to try again once the radio's queue was full.
 const RETRY_PAUSE: Duration = Duration::from_micros(500);
 const STATS_EVERY: Duration = Duration::from_secs(10);
+/// How long [`Running::stop`] waits for the engine thread before
+/// leaving it behind. The macOS port's air runs on a kext whose sysctls
+/// offer no readiness to await, so a wedged drain can hold the thread
+/// in the kernel indefinitely -- and must not hold the daemon's exit
+/// with it. (This timeout is the macOS port's one deviation from the
+/// vendored sources.)
+const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A frame heard on the air.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,11 +176,21 @@ impl Running {
     }
 
     /// Stops the node, and waits for its thread, which drops the [`Air`]
-    /// and [`Netif`].
+    /// and [`Netif`]. A thread that will not stop within [`STOP_TIMEOUT`]
+    /// is left behind rather than taking the host down with it.
     pub fn stop(mut self) {
         let _ = self.stop.send(true);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            let deadline = Instant::now() + STOP_TIMEOUT;
+            while !t.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            } else {
+                tracing::warn!("the engine thread did not stop; leaving it behind");
+                drop(t); // detaches it; the process is on its way out
+            }
         }
     }
 }

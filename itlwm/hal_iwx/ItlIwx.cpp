@@ -14160,10 +14160,19 @@ awdlSessionLeaveGated()
                             IEEE80211_NODE_HT_SGI20 |
                             IEEE80211_NODE_VHT);
     if (gAwdl.ring) {
-        IOFree(gAwdl.ring, AWDL_SESSION_RING_SIZE);
+        /* v2.3: the pointer is taken under the ring's lock and the
+         * memory freed outside it -- a reader draining debug.itlawdl_rx
+         * (or the RX hook) may be walking the ring when the session
+         * goes; both re-check gAwdl.ring under the same lock before
+         * touching it again. v2 freed it with no lock at all. */
+        uint8_t *victim;
+        IOInterruptState rstate = IOSimpleLockLockDisableInterrupt(gAwdlRingLock);
+        victim = gAwdl.ring;
         gAwdl.ring = NULL;
+        gAwdl.ring_head = gAwdl.ring_tail = gAwdl.ring_used = 0;
+        IOSimpleLockUnlockEnableInterrupt(gAwdlRingLock, rstate);
+        IOFree(victim, AWDL_SESSION_RING_SIZE);
     }
-    gAwdl.ring_head = gAwdl.ring_tail = gAwdl.ring_used = 0;
     gAwdl.cell = 0;
     gAwdl.state = AWDL_S_OFF;
     XYLog("itlawdl: session stopped, station mode restored\n");

@@ -111,6 +111,13 @@ awdl_ring_put(const uint8_t *frame, size_t len, uint8_t rate, int8_t rssi,
     if (!gAwdl.ring || !gAwdlRingLock || len == 0)
         return;
     st = IOSimpleLockLockDisableInterrupt(gAwdlRingLock);
+    if (!gAwdl.ring) {
+        /* v2.3: a session left while this frame was arriving -- its
+         * ring is gone with it (awdlSessionLeaveGated nulls the pointer
+         * under this same lock before freeing). */
+        IOSimpleLockUnlockEnableInterrupt(gAwdlRingLock, st);
+        return;
+    }
     if (gAwdl.ring_used + need > AWDL_SESSION_RING_SIZE) {
         gAwdl.rx_dropped++;
         IOSimpleLockUnlockEnableInterrupt(gAwdlRingLock, st);
@@ -214,23 +221,47 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
 static int
 awdl_rx_sysctl SYSCTL_HANDLER_ARGS
 {
-    size_t n;
+    size_t n, end, reclen;
+    const uint8_t *p;
     IOInterruptState st;
 
-    if (!gAwdlDrv || !gAwdl.ring || !gAwdlRingLock)
+    if (!gAwdlDrv || !gAwdlRingLock)
         return 0;
     if (!req->oldptr) {
         req->oldidx = (u_int)gAwdl.ring_used;
         return 0;
     }
     st = IOSimpleLockLockDisableInterrupt(gAwdlRingLock);
+    if (!gAwdl.ring) {
+        /* v2.3: no session, or one leaving -- nothing to drain. The
+         * check runs under the lock because awdlSessionLeaveGated
+         * nulls the pointer (and frees the ring) between the guard
+         * above and this point. */
+        IOSimpleLockUnlockEnableInterrupt(gAwdlRingLock, st);
+        return 0;
+    }
     n = gAwdl.ring_used;
     if (n > sizeof(gAwdlDrain))
         n = sizeof(gAwdlDrain);
     if (n > req->oldlen)
-        n = req->oldlen;    /* the tool tolerates a truncated tail */
+        n = req->oldlen;
+    /* v2.3: clamp to the last whole record. v2 handed out a tail cut
+     * mid-record ("the tool tolerates a truncated tail"), but the
+     * bytes already consumed left the reader to resume in the middle
+     * of a record it then read as a header -- a stream it could never
+     * re-sync. The rest of the cut record stays in the ring for the
+     * next read instead. */
+    p = gAwdl.ring + gAwdl.ring_tail;
+    end = 0;
+    while (end + AWDL_SESS_RXREC_HDR <= n) {
+        reclen = (size_t)((uint16_t)p[end] | ((uint16_t)p[end + 1] << 8));
+        if (end + AWDL_SESS_RXREC_HDR + reclen > n)
+            break;
+        end += AWDL_SESS_RXREC_HDR + reclen;
+    }
+    n = end;
     if (n) {
-        memcpy(gAwdlDrain, gAwdl.ring + gAwdl.ring_tail, n);
+        memcpy(gAwdlDrain, p, n);
         gAwdl.ring_tail += n;
         gAwdl.ring_used -= n;
         if (gAwdl.ring_tail == gAwdl.ring_head)
