@@ -6186,9 +6186,21 @@ iwx_rx_tx_cmd(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
         return;
     /* itlawdl v2.5: count the inject queue's completions — the v05/v06
      * field runs queued thousands of frames whose fate no counter
-     * could tell (ok counts writes, not transmissions). */
-    if (qid == IWX_DQA_INJECT_MONITOR_QUEUE)
+     * could tell (ok counts writes, not transmissions). v2.6: a
+     * completion that came back FAILED carries its verdict (lifetime
+     * over, fifo, abort, ...) in the status word — keep the last one,
+     * it separates "never scheduled" (done stays put) from
+     * "scheduled and refused" (done_err climbs). */
+    if (qid == IWX_DQA_INJECT_MONITOR_QUEUE) {
         gAwdl.inject_done++;
+        if (tx_resp->frame_count == 1) {
+            uint16_t st = le16toh(tx_resp->status.status);
+            if ((st & IWX_TX_STATUS_MSK) != IWX_TX_STATUS_SUCCESS) {
+                gAwdl.inject_done_err++;
+                gAwdl.inject_last_status = st;
+            }
+        }
+    }
     struct iwx_tx_ring *ring = &sc->txq[qid];
     struct iwx_tx_data *txd;
 
@@ -7482,6 +7494,34 @@ iwx_disable_beacon_filter(struct iwx_softc *sc)
     return err;
 }
 
+/* itlawdl v2.6: the inject queue's station binding, from
+ * debug.itlawdl_txsta (sc->sc_awdl_tx_sta). The v07 field run named
+ * the v2.5 binding (monitor station, GENERAL_PURPOSE, zero address) a
+ * black hole: ok climbed to 10 while done never moved off its
+ * boot-time 243 -- the firmware never serviced that queue -- and rx
+ * died at the very first TFD. Meanwhile the SAME queue number bound
+ * to sta 0 carried the boot-time traffic (243 completions) on this
+ * very card, which is what binding 1 repeats inside the cell. Binding
+ * 2 is iwlwifi's monitor-injection shape (aux-activity station). */
+static void
+awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type)
+{
+    switch (sel) {
+    case 1:
+        *sta_id = IWX_STATION_ID;
+        *sta_type = IWX_STA_LINK;
+        break;
+    case 2:
+        *sta_id = IWX_AUX_STA_ID;
+        *sta_type = IWX_STA_AUX_ACTIVITY;
+        break;
+    default:
+        *sta_id = IWX_MONITOR_STA_ID;
+        *sta_type = IWX_STA_GENERAL_PURPOSE;
+        break;
+    }
+}
+
 int ItlIwx::
 iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
 {
@@ -7499,8 +7539,13 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
     memset(&add_sta_cmd, 0, sizeof(add_sta_cmd));
     
     if (ic->ic_opmode == IEEE80211_M_MONITOR) {
-        add_sta_cmd.sta_id = IWX_MONITOR_STA_ID;
-        add_sta_cmd.station_type = IWX_STA_GENERAL_PURPOSE;
+        /* itlawdl v2.6: the inject station is selectable, see
+         * awdl_tx_sta_shape. Default 1 repeats the STA-mode shape that
+         * carried the boot-time traffic. */
+        int sid, stype;
+        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype);
+        add_sta_cmd.sta_id = sid;
+        add_sta_cmd.station_type = stype;
     } else {
         add_sta_cmd.sta_id = IWX_STATION_ID;
         add_sta_cmd.station_type = IWX_STA_LINK;
@@ -7508,9 +7553,16 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
     add_sta_cmd.mac_id_n_color
     = htole32(IWX_FW_CMD_ID_AND_COLOR(in->in_id, in->in_color));
     if (!update) {
-        if (ic->ic_opmode == IEEE80211_M_MONITOR)
+        if (ic->ic_opmode == IEEE80211_M_MONITOR &&
+            sc->sc_awdl_tx_sta == 0)
+            /* v2.5's shape: a zero address */
             IEEE80211_ADDR_COPY(&add_sta_cmd.addr,
                                 etheranyaddr);
+        else if (ic->ic_opmode == IEEE80211_M_MONITOR)
+            /* v2.6: our own address, like iwlwifi's aux station and
+             * the STA-mode station carry */
+            IEEE80211_ADDR_COPY(&add_sta_cmd.addr,
+                                ic->ic_myaddr);
         else
             IEEE80211_ADDR_COPY(&add_sta_cmd.addr,
                                 in->in_macaddr);
@@ -7653,9 +7705,13 @@ iwx_rm_sta_cmd(struct iwx_softc *sc, struct iwx_node *in)
     }
     
     memset(&rm_sta_cmd, 0, sizeof(rm_sta_cmd));
-    if (ic->ic_opmode == IEEE80211_M_MONITOR)
-        rm_sta_cmd.sta_id = IWX_MONITOR_STA_ID;
-    else
+    if (ic->ic_opmode == IEEE80211_M_MONITOR) {
+        /* itlawdl v2.6: remove the station the session actually
+         * added (awdl_tx_sta_shape's pick). */
+        int sid, stype;
+        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype);
+        rm_sta_cmd.sta_id = sid;
+    } else
         rm_sta_cmd.sta_id = IWX_STATION_ID;
     
     err = iwx_send_cmd_pdu(sc, IWX_REMOVE_STA, 0, sizeof(rm_sta_cmd),
@@ -9843,7 +9899,11 @@ iwx_auth(struct iwx_softc *sc)
     }
     
     if (ic->ic_opmode == IEEE80211_M_MONITOR) {
-        err = iwx_enable_txq(sc, IWX_MONITOR_STA_ID,
+        /* itlawdl v2.6: bind the inject queue to the selected
+         * station (awdl_tx_sta_shape). */
+        int sid, stype;
+        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype);
+        err = iwx_enable_txq(sc, sid,
                              IWX_DQA_INJECT_MONITOR_QUEUE, IWX_MGMT_TID,
                              sc->txq[IWX_DQA_INJECT_MONITOR_QUEUE].ring_count);
         if (err)
@@ -11405,6 +11465,11 @@ iwx_nic_error(struct iwx_softc *sc)
 {
     struct iwx_error_event_table table;
     uint32_t base;
+    
+    /* itlawdl v2.6: a firmware error dump is the wedge's signature.
+     * Count it here so the stats line says so (fw_err=) even when
+     * nobody reads the log. */
+    gAwdl.fw_err++;
     
     XYLog("%s: dumping device error log\n", DEVNAME(sc));
     base = sc->sc_uc.uc_lmac_error_event_table[0];
@@ -14006,7 +14071,8 @@ iwx_activate(struct iwx_softc *sc, int act)
  * AWDL's BSSID, which makes the firmware ACK the peer's unicast, the
  * way owly does on Linux with an ad-hoc cell. The inject queue is the
  * monitor one the init path already enables (iwx_auth's monitor branch:
- * IWX_DQA_INJECT_MONITOR_QUEUE / IWX_MONITOR_STA_ID). The sysctl layer
+ * IWX_DQA_INJECT_MONITOR_QUEUE; the station it binds to is
+ * v2.6-selectable, see awdl_tx_sta_shape). The sysctl layer
  * lives in AwdlSession.hpp.
  * ==================================================================== */
 
@@ -14127,11 +14193,15 @@ awdlSessionSetGated(int target, int cell_wanted)
     s = splnet();
     /* v1's trick, plus the cell: the monitor paths bring the whole chain
      * up (iwx_auth's monitor branch does phy ctxt on ic_ibss_chan, the
-     * MAC context through the cell branch above, binding, sta on
-     * IWX_MONITOR_STA_ID, and the inject queue). */
+     * MAC context through the cell branch above, binding, sta on the
+     * v2.6-selected station, and the inject queue). */
     ic->ic_opmode = IEEE80211_M_MONITOR;
     ic->ic_ibss_chan = &ic->ic_channels[AWDL_SESSION_CHANNEL];
     sc->sc_awdl_cell = cell;
+    /* v2.6: the inject binding for this session (debug.itlawdl_txsta,
+     * read here so a write between sessions takes effect on the next
+     * one). */
+    sc->sc_awdl_tx_sta = gAwdl.tx_sta_wanted;
     gAwdl.session = target;
     sc->sc_awdl_session = target;
 
@@ -14155,8 +14225,16 @@ awdlSessionSetGated(int target, int cell_wanted)
     gAwdl.cell = cell;
     gAwdl.cell_wanted = cell_wanted;
     gAwdl.channel = AWDL_SESSION_CHANNEL;
-    XYLog("itlawdl: %s session up (channel %d, fw mac type %d)\n",
-          target == 2 ? "cell" : "listen", AWDL_SESSION_CHANNEL, cell);
+    {
+        int sid, stype;
+        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype);
+        gAwdl.tx_sta = sc->sc_awdl_tx_sta;
+        gAwdl.tx_sta_id = sid;
+        gAwdl.tx_tid = IWX_MGMT_TID;
+    }
+    XYLog("itlawdl: %s session up (channel %d, fw mac type %d, inject sta %d)\n",
+          target == 2 ? "cell" : "listen", AWDL_SESSION_CHANNEL, cell,
+          gAwdl.tx_sta_id);
     return target;
 }
 
@@ -14269,11 +14347,21 @@ awdlInject(const uint8_t *req, size_t reqlen)
         }
     }
 
+    /* v2.6: v2.5 queued frames without a node reference, betting no
+     * completion would ever come to release one (none did). With the
+     * queue on a station the firmware actually services, every
+     * completion's iwx_txd_done releases a reference -- owe it. The
+     * v2.4 recycle path pays it back on its side; a session teardown
+     * that resets the ring with frames still in flight leaks a few,
+     * exactly like the data path already does at stop. */
+    ieee80211_ref_node(&in->in_ni);
     int rc = awdlTxInject(sc, m, in, tr);
     if (rc == 0) {
         gAwdl.inject_ok++;
         gAwdl.inject_bytes += frame_len;
     } else {
+        /* the frame never took a slot: the reference stays ours */
+        ieee80211_release_node(&sc->sc_ic, &in->in_ni);
         gAwdl.inject_err++;
     }
     return rc;
@@ -14409,14 +14497,19 @@ awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
          * A slot is only reached again after a full turn of the ring,
          * which at that pace is ~14 s after its TFD was kicked; the
          * firmware read it long before. Take the slot back: free the
-         * mbuf, clear the descriptor, run on. No node release --
-         * awdlInject never took a reference (the completion path's
-         * iwx_txd_done would release one we don't owe).
+         * mbuf, clear the descriptor, run on.
          * v2.5: every take-back is counted now (inject_recycled) —
-         * how much of the session rode on recycled slots, said. */
+         * how much of the session rode on recycled slots, said.
+         * v2.6: each queued frame owes the node reference its
+         * completion releases (awdlInject took one); a slot taken
+         * back early pays it here, the way iwx_txd_done would. */
         mbuf_freem(ring->data[idx].m);
         ring->data[idx].m = NULL;
-        ring->data[idx].in = NULL;
+        if (ring->data[idx].in) {
+            ieee80211_release_node(&sc->sc_ic,
+                                   &ring->data[idx].in->in_ni);
+            ring->data[idx].in = NULL;
+        }
         iwx_clear_tx_desc(sc, ring, idx);
         if (ring->queued > 0)
             ring->queued--;

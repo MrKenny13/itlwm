@@ -706,6 +706,18 @@ struct iwx_softc {
 	int sc_awdl_session;
 	int sc_awdl_cell;
 	int sc_awdl_cell_wanted;
+	/*
+	 * itlawdl v2.6: which station entry the inject queue binds to
+	 * (sysctl debug.itlawdl_txsta, read when a session comes up):
+	 * 0 = the monitor station (v2.5's binding -- GENERAL_PURPOSE,
+	 * zero address; the v07 field run showed its queue is never
+	 * serviced: ok climbs, done never moves, rx dies at the first
+	 * TFD), 1 = sta 0 in the STA-mode LINK shape (default -- the
+	 * binding the boot-time queue on this AX211 completed 243
+	 * frames through), 2 = an aux-activity station (iwlwifi's
+	 * monitor-injection shape).
+	 */
+	int sc_awdl_tx_sta;
 
 //	struct rwlock ioctl_rwl;
 

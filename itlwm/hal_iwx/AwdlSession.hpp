@@ -21,6 +21,20 @@
 //  bit belongs to the pre-AX210 TX command's flag word, and the gen3
 //  one reserves its bit 3; the firmware ACKs unicast on its own.
 //
+//  v2.6: the inject queue's station binding is selectable -- sysctl
+//  debug.itlawdl_txsta, read when a session comes up. 0 is v2.5's
+//  monitor station (GENERAL_PURPOSE, zero address): the v07 field run
+//  named its queue a black hole (ok climbed to 10 while done never
+//  moved off its boot-time 243 -- the firmware never serviced it --
+//  and rx died at the very first TFD). 1, the default, binds the
+//  queue to sta 0 in the STA-mode LINK shape -- the binding the
+//  boot-time traffic completed 243 frames through on this very card.
+//  2 is iwlwifi's monitor-injection shape (an aux-activity station).
+//  The inject stats grow done_err=/last= (completions that came back
+//  FAILED, their status word kept) and fw_err= (firmware error dumps
+//  seen), inject counters reset with the session now, and injected
+//  frames owe the node reference their completion releases.
+//
 //  With Wi-Fi turned OFF in macOS, `sysctl -w debug.itlawdl=2` restarts
 //  the firmware as a "cell" on channel 6: a PIBSS MAC context (Intel's
 //  pseudo-IBSS; a plain IBSS one receives nothing on this firmware) on
@@ -36,6 +50,9 @@
 //    debug.itlawdl        int rw   0 stop, 1 listen, 2 cell
 //    debug.itlawdl_cell   int rw   pin fw mac type: 0 auto (PIBSS),
 //                                  4 ibss, 3 pibss, 2 listener
+//    debug.itlawdl_txsta  int rw   inject queue binding: 0 monitor
+//                                  (v2.5), 1 sta0 LINK (default), 2
+//                                  aux -- read at session start
 //    debug.itlawdl_stats  string   counters
 //    debug.itlawdl_rx     opaque   drains received frames: 16-byte
 //                                  header (u16 len, u8 rate, i8 rssi,
@@ -91,9 +108,26 @@ struct awdl_session_state {
     /* inject accounting. done counts TX completions seen for the
      * inject queue (iwx_rx_tx_cmd / iwx_rx_tx_ba_notif) — the v05/v06
      * runs never saw one, which no counter could say. recycled counts
-     * the slots awdlTxInject took back the v2.4 way. */
+     * the slots awdlTxInject took back the v2.4 way. v2.6: done_err
+     * counts completions that came back FAILED (the status word of
+     * the last one kept in last_status — a lifetime/fifo/abort
+     * verdict separates "never scheduled" from "scheduled and
+     * refused"), and fw_err counts firmware error dumps
+     * (iwx_nic_error). The whole block resets with the session now,
+     * so done= reads "this session", not "since boot" (the v07 run
+     * read 243 at daemon start: the boot-time queue, not ours). */
     uint64_t inject_ok, inject_err, inject_bytes;
     uint64_t inject_done, inject_recycled;
+    uint64_t inject_done_err;
+    uint32_t inject_last_status;
+    uint64_t fw_err;
+
+    /* v2.6: the binding this session's inject queue came up on
+     * (tx_sta = debug.itlawdl_txsta's value at session start;
+     * tx_sta_id/tx_tid the resolved queue mapping). Written at
+     * session start like cell/channel, not reset. */
+    int tx_sta_wanted;
+    int tx_sta, tx_sta_id, tx_tid;
 
     /* rx ring: length-prefixed records, drained by debug.itlawdl_rx */
     uint8_t *ring;
@@ -158,7 +192,7 @@ static void
 awdl_session_reset_counters(void)
 {
     memset(&gAwdl.rx, 0,
-           offsetof(struct awdl_session_state, inject_ok) -
+           offsetof(struct awdl_session_state, tx_sta_wanted) -
            offsetof(struct awdl_session_state, rx));
     gAwdl.last_seq = (uint64_t)-1;
     uint64_t now;
@@ -213,16 +247,32 @@ awdl_cell_sysctl SYSCTL_HANDLER_ARGS
 }
 
 static int
+awdl_txsta_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = gAwdl.tx_sta_wanted;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr)
+        return err;
+    if (v < 0 || v > 2)
+        return EINVAL;
+    /* takes effect at the next session start; the stats line says
+     * which binding is live (txsta=). */
+    gAwdl.tx_sta_wanted = v;
+    return 0;
+}
+
+static int
 awdl_stats_sysctl SYSCTL_HANDLER_ARGS
 {
-    static char buf[512];
+    static char buf[640];
     int n;
 
     n = snprintf(buf, sizeof(buf),
         "rx=%llu bytes=%llu dropped=%llu dup=%llu\n"
         "awdl action=%llu psf=%llu mif=%llu other=%llu data=%llu data_bytes=%llu\n"
         "peer %02x:%02x:%02x:%02x:%02x:%02x rssi=%d\n"
-        "inject ok=%llu err=%llu bytes=%llu done=%llu recycled=%llu\n"
+        "inject ok=%llu err=%llu bytes=%llu done=%llu recycled=%llu done_err=%llu last=0x%x\n"
+        "fw_err=%llu txsta=%d(sta %d tid %d want %d)\n"
         "state=%d cell=%d(want %d) channel=%d\n",
         gAwdl.rx, gAwdl.rx_bytes, gAwdl.rx_dropped, gAwdl.dup,
         gAwdl.action, gAwdl.psf, gAwdl.mif, gAwdl.other_action,
@@ -232,6 +282,9 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         gAwdl.peer_rssi,
         gAwdl.inject_ok, gAwdl.inject_err, gAwdl.inject_bytes,
         gAwdl.inject_done, gAwdl.inject_recycled,
+        gAwdl.inject_done_err, (unsigned)gAwdl.inject_last_status,
+        gAwdl.fw_err, gAwdl.tx_sta, gAwdl.tx_sta_id, gAwdl.tx_tid,
+        gAwdl.tx_sta_wanted,
         gAwdl.session, gAwdl.cell, gAwdl.cell_wanted, gAwdl.channel);
     if (n < 0)
         return EIO;
@@ -322,6 +375,9 @@ SYSCTL_PROC(_debug, OID_AUTO, itlawdl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_cell, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_cell_sysctl, "I",
             "pin fw mac type for the next session: 0 auto (pibss), 4 ibss, 3 pibss, 2 listener");
+SYSCTL_PROC(_debug, OID_AUTO, itlawdl_txsta, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            NULL, 0, awdl_txsta_sysctl, "I",
+            "inject queue station binding: 0 monitor (v2.5), 1 sta0 link (default), 2 aux -- read at session start");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_stats_sysctl, "A",
             "itlwm AWDL session counters");
@@ -342,8 +398,10 @@ awdl_session_attach(void)
     if (!gAwdlRingLock)
         gAwdlRingLock = IOSimpleLockAlloc();
     if (!gAwdlSysctlRegistered) {
+        gAwdl.tx_sta_wanted = 1;    /* v2.6 default: the STA-mode shape */
         sysctl_register_oid(&sysctl__debug_itlawdl);
         sysctl_register_oid(&sysctl__debug_itlawdl_cell);
+        sysctl_register_oid(&sysctl__debug_itlawdl_txsta);
         sysctl_register_oid(&sysctl__debug_itlawdl_stats);
         sysctl_register_oid(&sysctl__debug_itlawdl_rx);
         sysctl_register_oid(&sysctl__debug_itlawdl_tx);
@@ -363,6 +421,7 @@ awdl_session_detach(ItlIwx *iwx)
     if (gAwdlSysctlRegistered) {
         sysctl_unregister_oid(&sysctl__debug_itlawdl);
         sysctl_unregister_oid(&sysctl__debug_itlawdl_cell);
+        sysctl_unregister_oid(&sysctl__debug_itlawdl_txsta);
         sysctl_unregister_oid(&sysctl__debug_itlawdl_stats);
         sysctl_unregister_oid(&sysctl__debug_itlawdl_rx);
         sysctl_unregister_oid(&sysctl__debug_itlawdl_tx);
