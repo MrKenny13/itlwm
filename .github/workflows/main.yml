@@ -72,6 +72,38 @@ jobs:
           name: build-logs-${{ matrix.platform }}-${{ matrix.configuration }}
           path: logs
 
+  owlyd-mac:
+    name: owlyd-mac (engine)
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: |
+          set -euo pipefail
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build owlyd-mac
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path owlyd-mac/Cargo.toml
+          cargo test --release --manifest-path owlyd-mac/Cargo.toml -p owly-awdl --features driver
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          version=$(cargo metadata --manifest-path owlyd-mac/Cargo.toml --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "owlyd-mac") | .version')
+          short_sha=$(git rev-parse --short HEAD)
+          ditto -c -k --keepParent owlyd-mac/target/release/owlyd-mac \
+            "artifacts/owlyd-mac-v$version-alpha-$short_sha.zip"
+          cp owlyd-mac/README.md artifacts/owlyd-mac-README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: owlyd-mac
+          path: |
+            artifacts/owlyd-mac-*.zip
+            artifacts/owlyd-mac-README.md
+          if-no-files-found: error
+
   prerelease:
     name: Publish development build
     needs: build

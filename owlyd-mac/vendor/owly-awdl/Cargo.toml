@@ -1,0 +1,20 @@
+[package]
+name = "owly-awdl"
+description = "Sans-IO AWDL: frames and TLVs, sync and election, channel sequence, data path and peer table."
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/t4t5/owly"
+
+# Vendored from t4t5/owly (MIT) for owlyd-mac, the macOS port of the
+# engine onto the itlawdl kext. Unmodified sources; see LICENSE.
+
+[features]
+# The driver: a Node on a thread of its own, between a radio and the host's
+# network interface. Needs std and tokio.
+driver = ["dep:tokio", "dep:tracing"]
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"], optional = true }
+tracing = { version = "0.1", optional = true }

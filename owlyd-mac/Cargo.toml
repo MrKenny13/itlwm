@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["vendor/owly-awdl", "owlyd-mac"]
+
+[profile.release]
+lto = "thin"
+strip = true

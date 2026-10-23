@@ -1,0 +1,18 @@
+[package]
+name = "owlyd-mac"
+description = "The AWDL engine on macOS: owly-awdl's node on the itlawdl kext's cell."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[[bin]]
+name = "owlyd-mac"
+path = "src/main.rs"
+
+[dependencies]
+owly-awdl = { path = "../vendor/owly-awdl", features = ["driver"] }
+libc = "0.2"
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "signal", "net", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter"] }
