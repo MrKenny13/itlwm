@@ -78,7 +78,7 @@ fn run() -> io::Result<()> {
     wifi.off()?;
 
     if let Err(e) = session(addr, &name, &mut wifi) {
-        session_down();
+        session_down_checked();
         wifi.on();
         return Err(e);
     }
@@ -89,7 +89,7 @@ fn run() -> io::Result<()> {
 /// back: the cell, the utun, the engine, the monitor. The caller puts
 /// the interface back if any of it fails.
 fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
-    session_up()?;
+    bring_cell_up(wifi)?;
     let utun = UtunSetup::open(addr)?;
     println!("== utun {} (index {})", utun.name, utun.index);
 
@@ -122,7 +122,7 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
     // leave the sysctl alone before the session -- and its ring with it
     // -- goes away.
     std::thread::sleep(Duration::from_millis(50));
-    session_down();
+    session_down_checked();
     wifi.on();
     println!("== session arrêtée, Wi-Fi rendu. À la prochaine.");
     Ok(())
@@ -141,6 +141,8 @@ async fn monitor(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_peers: Vec<PeerInfo> = Vec::new();
     let mut last_iters: u64 = 0;
+    let mut inject: Option<(u64, u64)> = None;
+    let mut warned_inject = false;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return,
@@ -176,6 +178,18 @@ async fn monitor(
                 if let Ok(stats) = sysctl::read_string("debug.itlawdl_stats") {
                     let one = stats.lines().map(|l| l.trim()).collect::<Vec<_>>().join(" | ");
                     println!("— {one}");
+                    // A kext before v2.4 never frees the inject queue's
+                    // slots: ok freezes (330 on the AX211) and err climbs
+                    // by every frame the engine builds. Say it once, in
+                    // the user's words, instead of a silent dead radio.
+                    let now = radio_inject();
+                    if let (Some((ok, err)), Some((was_ok, was_err))) = (now, inject) {
+                        if !warned_inject && err > was_err + 100 && ok == was_ok {
+                            println!("— kext : la file d'émission sature (ok={ok}, err={err}) — c'est la limite des ~330 trames des kexts v2.2/v2.3 ; le kext v2.4 la recycle");
+                            warned_inject = true;
+                        }
+                    }
+                    inject = now;
                 }
                 let iters = engine.load(Ordering::Relaxed);
                 println!("— moteur : {} itérations en 10 s", iters - last_iters);
@@ -183,6 +197,77 @@ async fn monitor(
             }
         }
     }
+}
+
+/// Brings the cell up and PROVES it can hear: a session the firmware
+/// brought up half-way looks perfectly healthy to the sysctls (v0.1.3's
+/// field run: state=2, injections accepted, 90 s of rx=0 — not even the
+/// infra beacons), so the only honest check is to listen. Twelve seconds
+/// of anything — beacons, a peer's action frames — means the radio
+/// lives; nothing at all means the session is deaf, and the cure that
+/// has worked every time so far is a full power cycle (Wi-Fi on → off)
+/// right before the cell goes up: that is the sequence every session
+/// that ever received was brought up with.
+fn bring_cell_up(wifi: &mut Wifi) -> io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        session_up()?;
+        println!("== j'écoute la radio 12 s — elle doit capter quelque chose (balises, l'iPhone)…");
+        std::thread::sleep(Duration::from_secs(12));
+        match radio_rx() {
+            Some(n) if n > 0 => {
+                println!("== la radio reçoit : {n} trames. En avant.");
+                return Ok(());
+            }
+            seen => {
+                attempt += 1;
+                if attempt >= 3 {
+                    return Err(io::Error::other(format!(
+                        "la radio reste muette ({}) après 3 essais. Envoie le journal du kext : \
+                         sudo log show --last 15m --predicate 'eventMessage contains \"itlawdl\"'",
+                        seen.map(|n| format!("rx={n}")).unwrap_or_else(|| "stats illisibles".into())
+                    )));
+                }
+                println!(
+                    "== la radio ne capte rien (essai {attempt}/2) — je la recycle : session basse, Wi-Fi on → off, session haute…"
+                );
+                session_down_checked();
+                wifi.cycle();
+            }
+        }
+    }
+}
+
+/// The kext's rx counter since the session came up, off its stats.
+fn radio_rx() -> Option<u64> {
+    let s = sysctl::read_string("debug.itlawdl_stats").ok()?;
+    s.lines()
+        .next()?
+        .strip_prefix("rx=")?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The kext's inject counters, off its stats.
+fn radio_inject() -> Option<(u64, u64)> {
+    let s = sysctl::read_string("debug.itlawdl_stats").ok()?;
+    let l = s.lines().find(|l| l.starts_with("inject"))?;
+    let mut ok = None;
+    let mut err = None;
+    for w in l.split_whitespace() {
+        if let Some((k, v)) = w.split_once('=') {
+            if let Ok(v) = v.parse::<u64>() {
+                match k {
+                    "ok" => ok = Some(v),
+                    "err" => err = Some(v),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some((ok?, err?))
 }
 
 /// Brings the cell up, with the kext's own words for a refusal.
@@ -244,8 +329,20 @@ fn session_up() -> io::Result<()> {
     Err(io::Error::other("la cellule n'a pas monté (délai)"))
 }
 
-fn session_down() {
+/// Session down, and SEEN down: the kext applies the writes through a
+/// thread_call that reads `want` when it fires, so a down followed
+/// quickly by an up can collapse into one — leaving the previous
+/// session (and its ring) in place under the new one's name. Every
+/// teardown that precedes a new session up waits for the OFF here.
+fn session_down_checked() {
     let _ = sysctl::set_int("debug.itlawdl", state::OFF);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if matches!(sysctl::get_int("debug.itlawdl"), Ok(v) if v == state::OFF) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// The Wi-Fi interface's power, as networksetup sees it.
@@ -291,6 +388,24 @@ impl Wifi {
             .status();
         self.was_on = false;
         println!("== Wi-Fi rallumé");
+    }
+
+    /// A full power cycle, for a radio that came up deaf: every session
+    /// that ever received was brought up right after one of these (the
+    /// daemon's own cut, or a manual one) — the ones brought up without
+    /// it have all been mute. The final restore obligation is untouched:
+    /// whatever the interface was when we started is what it gets back.
+    fn cycle(&mut self) {
+        println!("== Wi-Fi on (réveil radio)…");
+        let _ = Command::new("/usr/sbin/networksetup")
+            .args(["-setairportpower", &self.interface, "on"])
+            .status();
+        std::thread::sleep(Duration::from_secs(4));
+        println!("== Wi-Fi off…");
+        let _ = Command::new("/usr/sbin/networksetup")
+            .args(["-setairportpower", &self.interface, "off"])
+            .status();
+        std::thread::sleep(Duration::from_secs(3));
     }
 }
 

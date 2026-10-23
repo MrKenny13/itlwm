@@ -40,10 +40,19 @@ not one peer from a ring the reader kept feeding. Two causes, both
 fixed in v0.1.3: the utun's AsyncFd reads (a cached-readiness spin
 inside the driver's biased select) and a zombie session from a
 brutally killed run (the OFF→CELL sysctl pair collapsed, and the new
-session inherited the dead one's ring). The engine's own loop was
-replayed for 80 s on Linux with backlog, garbage frames, slow writes
-and kernel DAD traffic — it never froze; the freeze was the I/O
-threads' to cause, and they no longer can.
+session inherited the dead one's ring).
+
+The v04 run proved the engine alive — STATS every 10 s, ~26 loop
+iterations a second, 24 frames/s built and injected — and uncovered
+what only a live engine could: the kext's inject queue never sees its
+completions (330 TFDs, then ENOBUFS forever: the Mac goes silent ~14 s
+in), and a cell can come up deaf (90 s of rx=0, not even infra
+beacons — every session that ever received was brought up right after
+a full Wi-Fi power cycle). v0.1.4 listens for 12 s after the cell goes
+up and, hearing nothing, recycles the radio (Wi-Fi on → off) and tries
+again; itlawdl v2.4 reclaims the inject queue's slots when the ring
+comes back around, and an enable() that fails now fails the session
+instead of leaving a deaf one up.
 
 ## Credits
 

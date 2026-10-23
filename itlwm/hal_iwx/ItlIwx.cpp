@@ -14127,9 +14127,21 @@ awdlSessionSetGated(int target, int cell_wanted)
     sc->sc_awdl_session = target;
 
     gAwdl.entering = 1;
-    (void)enable(NULL);
+    IOReturn en = enable(NULL);
     gAwdl.entering = 0;
     splx(s);
+
+    if (en != kIOReturnSuccess) {
+        /* v2.4: a session that half-came-up is worse than none. The
+         * v04 field run sat in one for 90 s: state=2, injections
+         * accepted, and not one frame delivered by the radio (rx=0
+         * the whole run, not even infra beacons). Bring it back down
+         * and say so -- the daemon (v0.1.4) recycles the radio and
+         * retries instead of running a deaf cell. */
+        XYLog("itlawdl: enable() failed (0x%x) -- bringing the session down\n", en);
+        awdlSessionLeaveGated();
+        return AWDL_S_FAILED;
+    }
 
     gAwdl.cell = cell;
     gAwdl.cell_wanted = cell_wanted;
@@ -14381,8 +14393,22 @@ awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
     }
     idx = (ring->cur & (ring->ring_count - 1));
     if (ring->data[idx].m) {
-        mbuf_freem(m);
-        return ENOBUFS;
+        /* v2.4: this queue's completions never come back on this
+         * firmware (observed on the AX211: 330 TFDs taken, then
+         * ENOBUFS forever while the engine kept handing frames at
+         * 24/s -- the Mac went radio-silent ~14 s into the session).
+         * A slot is only reached again after a full turn of the ring,
+         * which at that pace is ~14 s after its TFD was kicked; the
+         * firmware read it long before. Take the slot back: free the
+         * mbuf, clear the descriptor, run on. No node release --
+         * awdlInject never took a reference (the completion path's
+         * iwx_txd_done would release one we don't owe). */
+        mbuf_freem(ring->data[idx].m);
+        ring->data[idx].m = NULL;
+        ring->data[idx].in = NULL;
+        iwx_clear_tx_desc(sc, ring, idx);
+        if (ring->queued > 0)
+            ring->queued--;
     }
     desc = &ring->desc[idx];
     memset(desc, 0, sizeof(*desc));

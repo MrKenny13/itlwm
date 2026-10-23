@@ -6,6 +6,12 @@
 //  of the AirDrop-on-Intel work, ported onto this driver by the v1
 //  probe's pattern (AwdlProbe.hpp).
 //
+//  v2.4: the inject queue's slots are reclaimed when the ring comes
+//  back around (its completions never arrive on this firmware -- the
+//  v04 field run exhausted them at 330 TFDs and went radio-silent),
+//  and an enable() that fails now fails the session instead of
+//  leaving a deaf cell up.
+//
 //  With Wi-Fi turned OFF in macOS, `sysctl -w debug.itlawdl=2` restarts
 //  the firmware as a "cell" on channel 6: a PIBSS MAC context (Intel's
 //  pseudo-IBSS; a plain IBSS one receives nothing on this firmware) on
