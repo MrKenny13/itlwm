@@ -54,10 +54,17 @@ jobs:
           configuration=$(printf '%s' "$CONFIGURATION" | tr '[:lower:]' '[:upper:]')
           suffix="v$version-$configuration-alpha-$short_sha"
           ditto -c -k --keepParent "$products/$PLATFORM/AirportItlwm.kext" "artifacts/AirportItlwm-$PLATFORM-$suffix.zip"
+      - name: Build itlawdlctl (AWDL userspace tool)
+        run: |
+          set -euo pipefail
+          xcrun --sdk macosx clang -O2 -Wall -arch x86_64 \
+            -o artifacts/itlawdlctl tools/itlawdlctl.c
       - uses: actions/upload-artifact@v4
         with:
           name: AirportItlwm-${{ matrix.platform }}-${{ matrix.configuration }}
-          path: artifacts/AirportItlwm-${{ matrix.platform }}-*.zip
+          path: |
+            artifacts/AirportItlwm-${{ matrix.platform }}-*.zip
+            artifacts/itlawdlctl
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()

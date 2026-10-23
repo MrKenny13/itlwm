@@ -53,6 +53,9 @@ public:
     virtual ItlDriverInfo *getDriverInfo() = 0;
     
     virtual ItlDriverController *getDriverController() = 0;
+
+    /* AWDL session (hal_iwx only): leave it before Wi-Fi comes back. */
+    virtual void awdlSessionStop() {}
     
     virtual void free() override;
 

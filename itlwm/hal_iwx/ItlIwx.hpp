@@ -126,6 +126,9 @@
 #include "if_iwxvar.h"
 #include <sys/pcireg.h>
 
+/* itlawdl v2 (AwdlSession.hpp): the TX request header, built there */
+struct itlawdl_txreq;
+
 #include <IOKit/network/IOEthernetController.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/network/IOGatedOutputQueue.h>
@@ -166,6 +169,23 @@ public:
     virtual ItlDriverInfo *getDriverInfo() override;
     
     virtual ItlDriverController *getDriverController() override;
+    
+    /* itlawdl v2: AWDL session (AwdlSession.hpp). Set/leave run in the
+     * command gate; the rx/tx sysctls and the Airport layer's setPOWER
+     * come in through these. */
+    int awdlSessionSet(int target, int cell_wanted);
+    void awdlSessionStop() override;
+public:
+    void awdlSessionLeaveGated();
+    int awdlInject(const uint8_t *req, size_t reqlen);
+private:
+    int awdlSessionSetGated(int target, int cell_wanted);
+    int awdlRxHook(mbuf_t m, int chanidx, uint32_t rx_pkt_status,
+                   int is_shortpre, uint32_t rate_n_flags,
+                   uint64_t device_timestamp, struct ieee80211_rxinfo *rxi);
+    int awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
+                     const struct itlawdl_txreq *tr);
+public:
     
     //driver info
     virtual const char *getFirmwareVersion() override;

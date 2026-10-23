@@ -695,6 +695,18 @@ struct iwx_softc {
 
 	int sc_generation;
 
+	/*
+	 * itlawdl v2 (AwdlSession.hpp): sc_awdl_session is 0 (none), 1
+	 * (listen, LISTENER MAC context), or 2 (cell: IBSS/PIBSS on AWDL's
+	 * BSSID, the firmware ACKs the peer's unicast, injection enabled).
+	 * sc_awdl_cell is the fw mac type the mac_ctxt cell branch uses;
+	 * sc_awdl_cell_wanted pins it for the next session (sysctl
+	 * debug.itlawdl_cell).
+	 */
+	int sc_awdl_session;
+	int sc_awdl_cell;
+	int sc_awdl_cell_wanted;
+
 //	struct rwlock ioctl_rwl;
 
 	int sc_cap_off; /* PCIe caps */

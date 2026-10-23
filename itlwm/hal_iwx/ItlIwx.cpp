@@ -110,6 +110,7 @@
 #include "../../AirportItlwm/WCL/WCL.hpp"
 #endif
 #include "ItlIwx.hpp"
+#include "AwdlSession.hpp"
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <FwData.h>
@@ -157,12 +158,21 @@ bool ItlIwx::attach(IOPCIDevice *device)
         releaseAll();
         return false;
     }
+    if (gAwdlDrv == NULL) {
+        /* itlawdl v2: the one card we drive */
+        gAwdlDrv = this;
+        awdl_session_attach();
+    }
     return true;
 }
 
 void ItlIwx::
 detach(IOPCIDevice *device)
 {
+    if (gAwdlDrv == this) {
+        /* itlawdl v2: stop any session before the firmware goes */
+        awdl_session_detach(this);
+    }
 #ifdef AIRPORT_VTD
     getMainCommandGate()->runAction(
         [](OSObject *, void *arg0, void *arg1, void *, void *) -> IOReturn {
@@ -260,6 +270,9 @@ getDriverController()
 IOReturn ItlIwx::enable(IONetworkInterface *netif)
 {
     XYLog("%s\n", __PRETTY_FUNCTION__);
+    /* Wi-Fi coming back while an AWDL session runs: give the card back first. */
+    if (gAwdl.session && !gAwdl.entering)
+        awdlSessionLeaveGated();
     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
     if (ifp->if_flags & IFF_UP) {
         XYLog("%s already in activating state\n", __FUNCTION__);
@@ -5361,6 +5374,19 @@ iwx_rx_frame(struct iwx_softc *sc, mbuf_t m, int chanidx,
         chanidx = ieee80211_chan2ieee(ic, ic->ic_ibss_chan);
     
     wh = mtod(m, struct ieee80211_frame *);
+    if (gAwdl.session && gAwdlDrv == this) {
+        /*
+         * itlawdl v2: tap every frame into the session's ring. In cell
+         * mode (2) the frame is consumed here -- userspace owns it
+         * through debug.itlawdl_rx -- and in listen mode (1) it continues
+         * up the normal monitor path, as the v1 probe did.
+         */
+        if (awdlRxHook(m, chanidx, rx_pkt_status, is_shortpre,
+                       rate_n_flags, device_timestamp, rxi) != 0) {
+            mbuf_freem(m);
+            return;
+        }
+    }
     ni = ieee80211_find_rxnode(ic, wh);
     if ((rxi->rxi_flags & IEEE80211_RXI_HWDEC) &&
         iwx_ccmp_decap(sc, m, ni, rxi) != 0) {
@@ -8685,6 +8711,64 @@ iwx_mac_ctxt_cmd_common(struct iwx_softc *sc, struct iwx_node *in,
     if (action == IWX_FW_CTXT_ACTION_REMOVE)
         return;
 
+    if (sc->sc_awdl_cell) {
+        /*
+         * itlawdl v2: the "cell". Same shape as the monitor setup, but
+         * the MAC context is an (pseudo-)IBSS one on AWDL's BSSID with
+         * our own address, so the firmware ACKs the peer's unicast data
+         * frames on that BSSID (owly's ad-hoc cell, as on Linux iwlwifi).
+         */
+        static const uint8_t awdl_bssid[6] =
+            { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
+        cmd->mac_type = htole32(sc->sc_awdl_cell);
+        cmd->tsf_id = htole32(IWX_TSF_ID_A);
+        IEEE80211_ADDR_COPY(cmd->node_addr, ic->ic_myaddr);
+        IEEE80211_ADDR_COPY(cmd->bssid_addr, awdl_bssid);
+        iwx_ack_rates(sc, in, &cck_ack_rates, &ofdm_ack_rates);
+        cmd->cck_rates = htole32(cck_ack_rates);
+        cmd->ofdm_rates = htole32(ofdm_ack_rates);
+        cmd->cck_short_preamble
+        = htole32((ic->ic_flags & IEEE80211_F_SHPREAMBLE)
+                  ? IWX_MAC_FLG_SHORT_PREAMBLE : 0);
+        cmd->short_slot
+        = htole32((ic->ic_flags & IEEE80211_F_SHSLOT)
+                  ? IWX_MAC_FLG_SHORT_SLOT : 0);
+        for (i = 0; i < EDCA_NUM_AC; i++) {
+            struct ieee80211_edca_ac_params *ac = &ic->ic_edca_ac[i];
+            int txf = iwx_ac_to_tx_fifo[i];
+            uint8_t ucode_ac =
+                iwx_mvm_mac80211_ac_to_ucode_ac((enum ieee80211_edca_ac)i);
+            cmd->ac[ucode_ac].cw_min = htole16(IWX_EXP2(ac->ac_ecwmin));
+            cmd->ac[ucode_ac].cw_max = htole16(IWX_EXP2(ac->ac_ecwmax));
+            cmd->ac[ucode_ac].aifsn = ac->ac_aifsn;
+            cmd->ac[ucode_ac].fifos_mask = (1 << txf);
+            cmd->ac[ucode_ac].edca_txop = htole16(ac->ac_txoplimit * 32);
+        }
+        if (ni->ni_flags & IEEE80211_NODE_QOS)
+            cmd->qos_flags |= htole32(IWX_MAC_QOS_FLG_UPDATE_EDCA);
+        if (ni->ni_flags & IEEE80211_NODE_HT)
+            cmd->qos_flags |= htole32(IWX_MAC_QOS_FLG_TGN);
+        if (ic->ic_flags & IEEE80211_F_USEPROT)
+            cmd->protection_flags |= htole32(IWX_MAC_PROT_FLG_TGG_PROTECT);
+        /*
+         * The cell beacons as rarely as the firmware lets it (owly:
+         * 10000 TU; an iPhone restarted beside a cell beaconing every
+         * 100 TU didn't list us, one beside a cell beaconing every 10 s
+         * did). beacon_template 0: we never install one.
+         */
+        if (sc->sc_awdl_cell == IWX_FW_MAC_TYPE_IBSS) {
+            cmd->ibss.beacon_time = htole32(0);
+            cmd->ibss.beacon_tsf = htole64(0);
+            cmd->ibss.bi = htole32(10000);
+            cmd->ibss.bi_reciprocal = htole32(iwx_reciprocal(10000));
+            cmd->ibss.beacon_template = htole32(0);
+        } else {
+            cmd->pibss.is_disc_extended = htole32(0);
+        }
+        cmd->filter_flags = htole32(IWX_MAC_FILTER_ACCEPT_GRP);
+        return;
+    }
+
     if (ic->ic_opmode == IEEE80211_M_MONITOR)
         cmd->mac_type = htole32(IWX_FW_MAC_TYPE_LISTENER);
     else if (ic->ic_opmode == IEEE80211_M_STA)
@@ -8813,7 +8897,19 @@ iwx_mac_ctxt_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action,
                                 sizeof(cmd), &cmd);
     }
 
-    if (ic->ic_opmode == IEEE80211_M_MONITOR) {
+    if (sc->sc_awdl_cell) {
+        /*
+         * itlawdl v2: the cell's RX filters. No promisc: the peer's
+         * frames are on our own BSSID already, so they come up as
+         * intra-BSS traffic; control and mgmt are passed to the host,
+         * foreign beacons and probe requests too. No IN_CRC32: frames
+         * are delivered without FCS, ready for the userspace engine.
+         */
+        cmd.filter_flags |= htole32(IWX_MAC_FILTER_IN_CONTROL_AND_MGMT |
+                                    IWX_MAC_FILTER_IN_BEACON |
+                                    IWX_MAC_FILTER_IN_PROBE_REQUEST |
+                                    IWX_MAC_FILTER_ACCEPT_GRP);
+    } else if (ic->ic_opmode == IEEE80211_M_MONITOR) {
         cmd.filter_flags |= htole32(IWX_MAC_FILTER_IN_PROMISC |
                                     IWX_MAC_FILTER_IN_CONTROL_AND_MGMT |
                                     IWX_MAC_FILTER_ACCEPT_GRP |
@@ -9668,15 +9764,27 @@ iwx_auth(struct iwx_softc *sc)
     
     splassert(IPL_NET);
     
-    in->in_ni.ni_chw = IEEE80211_CHAN_WIDTH_20_NOHT;
-    in->in_ni.ni_flags &= ~(IEEE80211_NODE_HT |
-                            IEEE80211_NODE_QOS |
-                            IEEE80211_NODE_HT_SGI20 |
-                            IEEE80211_NODE_HT_SGI40 |
-                            IEEE80211_NODE_VHT |
-                            IEEE80211_NODE_VHT_SGI80 |
-                            IEEE80211_NODE_VHT_SGI160 |
-                            IEEE80211_NODE_HE);
+    if (ic->ic_opmode == IEEE80211_M_MONITOR && sc->sc_awdl_cell) {
+        /*
+         * itlawdl v2: keep the cell's HT20 shape on the node -- the MAC
+         * context, ack rates and sta command below are built from it, and
+         * a non-HT cell neither hears nor ACKs the peer's HT unicast
+         * (owly). Set up by awdlSessionSetGated before enable().
+         */
+        in->in_ni.ni_chw = IEEE80211_CHAN_WIDTH_20;
+        in->in_ni.ni_flags |= IEEE80211_NODE_HT | IEEE80211_NODE_QOS;
+        in->in_ni.ni_htop1 = 0;    /* HTPROT_NONE */
+    } else {
+        in->in_ni.ni_chw = IEEE80211_CHAN_WIDTH_20_NOHT;
+        in->in_ni.ni_flags &= ~(IEEE80211_NODE_HT |
+                                IEEE80211_NODE_QOS |
+                                IEEE80211_NODE_HT_SGI20 |
+                                IEEE80211_NODE_HT_SGI40 |
+                                IEEE80211_NODE_VHT |
+                                IEEE80211_NODE_VHT_SGI80 |
+                                IEEE80211_NODE_VHT_SGI160 |
+                                IEEE80211_NODE_HE);
+    }
     if (ic->ic_opmode == IEEE80211_M_MONITOR) {
         err = iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[0],
                                   ic->ic_ibss_chan, 1, 1, 0);
@@ -13867,5 +13975,506 @@ iwx_activate(struct iwx_softc *sc, int act)
             break;
     }
     
+    return 0;
+}
+
+/* ====================================================================
+ * itlawdl v2 -- AWDL session (cell + injection + RX ring), the port of
+ * the v1 probe's pattern onto this driver: the session rides the v1
+ * monitor trick (ic_opmode MONITOR + ic_ibss_chan 6 + enable(NULL)),
+ * and sc_awdl_cell turns the MAC context into an (pseudo-)IBSS one on
+ * AWDL's BSSID, which makes the firmware ACK the peer's unicast, the
+ * way owly does on Linux with an ad-hoc cell. The inject queue is the
+ * monitor one the init path already enables (iwx_auth's monitor branch:
+ * IWX_DQA_INJECT_MONITOR_QUEUE / IWX_MONITOR_STA_ID). The sysctl layer
+ * lives in AwdlSession.hpp.
+ * ==================================================================== */
+
+/* The cell's rates: a 11g cell whose lowest basic rate is 12 Mbit/s
+ * (owly's BASIC, what every AWDL device receives), so action frames and
+ * unicast data both default there; CCK and the rest of OFDM are
+ * supported rates. HT is signalled on the node separately. */
+static void
+awdl_node_rates(struct ieee80211_node *ni)
+{
+    static const uint8_t rates[] = {
+        2, 4, 11, 22,                    /* 1, 2, 5.5, 11 CCK */
+        12, 18, 36, 48, 108,             /* 6, 9, 18, 24, 54 OFDM */
+        24 | IEEE80211_RATE_BASIC,       /* 12 basic */
+        48 | IEEE80211_RATE_BASIC,       /* 24 basic */
+        72, 96                           /* 36, 48 */
+    };
+    struct ieee80211_rateset *rs = &ni->ni_rates;
+    int i, tx12 = 0;
+
+    memset(rs, 0, sizeof(*rs));
+    rs->rs_nrates = sizeof(rates) / sizeof(rates[0]);
+    for (i = 0; i < rs->rs_nrates; i++) {
+        rs->rs_rates[i] = rates[i];
+        if ((rates[i] & IEEE80211_RATE_VAL) == 24)
+            tx12 = i;    /* unicast data default: 12 Mbit/s */
+    }
+    ni->ni_txrate = tx12;
+}
+
+int ItlIwx::
+awdlSessionSet(int target, int cell_wanted)
+{
+    IOReturn ret = getMainCommandGate()->runAction(
+        [](OSObject *, void *arg0, void *arg1, void *arg2, void *) -> IOReturn {
+            ItlIwx *that = (ItlIwx *)arg0;
+            return (IOReturn)that->awdlSessionSetGated((int)(intptr_t)arg1,
+                                                      (int)(intptr_t)arg2);
+        }, this, (void *)(intptr_t)target, (void *)(intptr_t)cell_wanted);
+    return (int)ret;
+}
+
+/* In the gate. */
+int ItlIwx::
+awdlSessionSetGated(int target, int cell_wanted)
+{
+    struct iwx_softc *sc = &com;
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct _ifnet *ifp = IC2IFP(ic);
+    struct iwx_node *in = (struct iwx_node *)ic->ic_bss;
+    int cell, s;
+
+    if (target == gAwdl.session)
+        return gAwdl.state;
+    if (gAwdl.session)
+        awdlSessionLeaveGated();
+    if (target == 0)
+        return AWDL_S_OFF;
+
+    if (sc->sc_flags & IWX_FLAG_SHUTDOWN) {
+        XYLog("itlawdl: driver is shutting down\n");
+        return AWDL_S_FAILED;
+    }
+    if (ifp->if_flags & (IFF_UP | IFF_RUNNING)) {
+        XYLog("itlawdl: refused: turn Wi-Fi off first\n");
+        return AWDL_S_BUSY_WIFI_ON;
+    }
+    if (sc->sc_generation == 0) {
+        XYLog("itlawdl: firmware never came up; "
+              "turn Wi-Fi on once, then off, and retry\n");
+        return AWDL_S_FAILED;
+    }
+    if (isclr(ic->ic_chan_active, AWDL_SESSION_CHANNEL)) {
+        XYLog("itlawdl: channel %d not usable\n", AWDL_SESSION_CHANNEL);
+        return AWDL_S_FAILED;
+    }
+
+    if (!gAwdl.ring) {
+        gAwdl.ring = (uint8_t *)IOMalloc(AWDL_SESSION_RING_SIZE);
+        if (!gAwdl.ring)
+            return AWDL_S_FAILED;
+    }
+    gAwdl.ring_head = gAwdl.ring_tail = gAwdl.ring_used = 0;
+    awdl_session_reset_counters();
+
+    cell = 0;
+    if (target == 2)
+        cell = cell_wanted ? cell_wanted : IWX_FW_MAC_TYPE_IBSS;
+
+    /* the node's shape: the cell is HT20 (owly); the listener stays NOHT.
+     * iwx_auth keeps it for the cell (its monitor branch) and resets it
+     * for everything else, as before. */
+    if (cell) {
+        in->in_ni.ni_chw = IEEE80211_CHAN_WIDTH_20;
+        in->in_ni.ni_flags |= IEEE80211_NODE_HT | IEEE80211_NODE_QOS;
+        in->in_ni.ni_htop1 = 0;    /* HTPROT_NONE */
+        awdl_node_rates(&in->in_ni);
+    } else {
+        in->in_ni.ni_chw = IEEE80211_CHAN_WIDTH_20_NOHT;
+        in->in_ni.ni_flags &= ~(IEEE80211_NODE_HT |
+                                IEEE80211_NODE_QOS |
+                                IEEE80211_NODE_HT_SGI20 |
+                                IEEE80211_NODE_VHT);
+    }
+
+    s = splnet();
+    /* v1's trick, plus the cell: the monitor paths bring the whole chain
+     * up (iwx_auth's monitor branch does phy ctxt on ic_ibss_chan, the
+     * MAC context through the cell branch above, binding, sta on
+     * IWX_MONITOR_STA_ID, and the inject queue). */
+    ic->ic_opmode = IEEE80211_M_MONITOR;
+    ic->ic_ibss_chan = &ic->ic_channels[AWDL_SESSION_CHANNEL];
+    sc->sc_awdl_cell = cell;
+    gAwdl.session = target;
+    sc->sc_awdl_session = target;
+
+    gAwdl.entering = 1;
+    (void)enable(NULL);
+    gAwdl.entering = 0;
+    splx(s);
+
+    gAwdl.cell = cell;
+    gAwdl.cell_wanted = cell_wanted;
+    gAwdl.channel = AWDL_SESSION_CHANNEL;
+    XYLog("itlawdl: %s session up (channel %d, fw mac type %d)\n",
+          target == 2 ? "cell" : "listen", AWDL_SESSION_CHANNEL, cell);
+    return target;
+}
+
+/* In the gate. */
+void ItlIwx::
+awdlSessionLeaveGated()
+{
+    struct iwx_softc *sc = &com;
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct iwx_node *in = (struct iwx_node *)ic->ic_bss;
+
+    if (!gAwdl.session)
+        return;
+    gAwdl.session = 0;
+    sc->sc_awdl_session = 0;
+    sc->sc_awdl_cell = 0;
+    disable(NULL);
+    ic->ic_opmode = IEEE80211_M_STA;
+    in->in_ni.ni_chw = IEEE80211_CHAN_WIDTH_20_NOHT;
+    in->in_ni.ni_flags &= ~(IEEE80211_NODE_HT |
+                            IEEE80211_NODE_QOS |
+                            IEEE80211_NODE_HT_SGI20 |
+                            IEEE80211_NODE_VHT);
+    if (gAwdl.ring) {
+        IOFree(gAwdl.ring, AWDL_SESSION_RING_SIZE);
+        gAwdl.ring = NULL;
+    }
+    gAwdl.ring_head = gAwdl.ring_tail = gAwdl.ring_used = 0;
+    gAwdl.cell = 0;
+    gAwdl.state = AWDL_S_OFF;
+    XYLog("itlawdl: session stopped, station mode restored\n");
+}
+
+/* Called from the Airport layer (setPOWER) and from userspace-facing
+ * paths that are not already in the gate. */
+void ItlIwx::
+awdlSessionStop()
+{
+    if (!gAwdl.session)
+        return;
+    getMainCommandGate()->runAction(
+        [](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+            ((ItlIwx *)arg0)->awdlSessionLeaveGated();
+            return kIOReturnSuccess;
+        }, this);
+    gAwdl.state = AWDL_S_OFF;
+}
+
+/* ---- injection ---- */
+
+int ItlIwx::
+awdlInject(const uint8_t *req, size_t reqlen)
+{
+    struct iwx_softc *sc = &com;
+    struct iwx_node *in = (struct iwx_node *)sc->sc_ic.ic_bss;
+    const struct itlawdl_txreq *tr = (const struct itlawdl_txreq *)req;
+    const uint8_t *frame = req + sizeof(*tr);
+    size_t frame_len;
+    mbuf_t m;
+
+    if (reqlen < sizeof(*tr) + 10)
+        return EINVAL;
+    frame_len = le16toh(tr->frame_len);
+    if (frame_len < 10 || frame_len > AWDL_SESSION_MAX_FRAME ||
+        reqlen != sizeof(*tr) + frame_len)
+        return EINVAL;
+    if (!(sc->txq[IWX_DQA_INJECT_MONITOR_QUEUE].ring_count)) {
+        gAwdl.inject_err++;
+        return ENODEV;    /* no session, or the queue never came up */
+    }
+
+    if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || m == NULL)
+        return ENOMEM;
+    if (frame_len > (size_t)mbuf_get_mhlen()) {
+        mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m);
+        if (!(mbuf_flags(m) & MBUF_EXT)) {
+            mbuf_freem(m);
+            return ENOMEM;
+        }
+    }
+    memcpy((void *)mbuf_data(m), frame, frame_len);
+    mbuf_setlen(m, frame_len);
+    mbuf_pkthdr_setlen(m, frame_len);
+
+    /* steer the node, then let the existing rate logic apply: the
+     * request's rate through ni_txrate / HT through ni_txmcs (iwx_tx's
+     * own plumbing reads them). */
+    if (tr->flags & 0x02) {
+        in->in_ni.ni_flags |= IEEE80211_NODE_HT;
+        in->in_ni.ni_txmcs = tr->rate & 0x1f;
+    } else {
+        in->in_ni.ni_flags &= ~IEEE80211_NODE_HT;
+        if (tr->rate) {
+            struct ieee80211_rateset *rs = &in->in_ni.ni_rates;
+            int i;
+            for (i = 0; i < rs->rs_nrates; i++)
+                if ((rs->rs_rates[i] & IEEE80211_RATE_VAL) == tr->rate) {
+                    in->in_ni.ni_txrate = i;
+                    break;
+                }
+        }
+    }
+
+    int rc = awdlTxInject(sc, m, in, tr);
+    if (rc == 0) {
+        gAwdl.inject_ok++;
+        gAwdl.inject_bytes += frame_len;
+    } else {
+        gAwdl.inject_err++;
+    }
+    return rc;
+}
+
+/* Called from the RX path (iwx_rx_frame) while a session runs. */
+int ItlIwx::
+awdlRxHook(mbuf_t m, int chanidx, uint32_t rx_pkt_status,
+           int is_shortpre, uint32_t rate_n_flags,
+           uint64_t device_timestamp, struct ieee80211_rxinfo *rxi)
+{
+    struct ieee80211_frame *wh;
+    const uint8_t *frame = (const uint8_t *)mbuf_data(m);
+    size_t len = mbuf_len(m);
+    uint8_t rate = 0, flags = 0, chan = (uint8_t)chanidx;
+    int8_t rssi = (int8_t)rxi->rxi_rssi;
+    int is_awdl, type, subtype;
+
+    if (!gAwdl.session)
+        return 0;
+    if (len < sizeof(struct ieee80211_frame_min) || len > AWDL_SESSION_MAX_FRAME)
+        return (gAwdl.session == 2) ? 1 : 0;    /* consume even if unusable */
+    wh = (struct ieee80211_frame *)(void *)frame;
+
+    /* radiotap-style rate, as the bpf tap would have it */
+    if (rate_n_flags & IWX_RATE_MCS_HT_MSK) {
+        rate = 0x80 | (uint8_t)(rate_n_flags & 0xff);
+    } else {
+        uint8_t r = (uint8_t)(rate_n_flags & IWX_RATE_LEGACY_RATE_MSK);
+        switch (r) {
+            case 10: rate = 2; break;   /* 1 Mbit/s */
+            case 20: rate = 4; break;   /* 2 */
+            case 55: rate = 11; break;  /* 5.5 */
+            case 110: rate = 22; break; /* 11 */
+            case 0xd: rate = 12; break; /* 6 */
+            case 0xf: rate = 18; break; /* 9 */
+            case 0x5: rate = 24; break; /* 12 */
+            case 0x7: rate = 36; break; /* 18 */
+            case 0x9: rate = 48; break; /* 24 */
+            case 0xb: rate = 72; break; /* 36 */
+            case 0x1: rate = 96; break; /* 48 */
+            case 0x3: rate = 108; break;/* 54 */
+            default: rate = 0; break;
+        }
+    }
+    if (is_shortpre)
+        flags |= 1;
+
+    gAwdl.rx++;
+    gAwdl.rx_bytes += len;
+
+    /* classify, v1 style */
+    is_awdl = (memcmp(wh->i_addr3, kAwdlSessBssid, 6) == 0);
+    type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
+    subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+    if (is_awdl) {
+        memcpy(gAwdl.peer, wh->i_addr2, 6);
+        gAwdl.peer_rssi = rxi->rxi_rssi;
+        if (type == IEEE80211_FC0_TYPE_MGT && subtype == 0xd0) {
+            gAwdl.action++;
+            /* vendor action: category 0x7f, OUI 3, type, version, subtype */
+            if (len >= 32) {
+                uint8_t asub = frame[24 + 6];    /* subtype: cat 24, OUI 25..27, type 28, ver 29 */
+                switch (asub) {
+                    case 0: gAwdl.psf++; break;
+                    case 1: gAwdl.mif++; break;
+                    default: gAwdl.other_action++; break;
+                }
+            }
+        } else if (type == IEEE80211_FC0_TYPE_DATA) {
+            uint16_t seq = ((uint16_t)wh->i_seq[0] |
+                            ((uint16_t)wh->i_seq[1] << 8));
+            seq = (seq >> 4) & 0xfff;
+            gAwdl.data++;
+            gAwdl.data_bytes += len;
+            if (seq == gAwdl.last_seq)
+                gAwdl.dup++;    /* the peer retransmitted: we did not ACK */
+            gAwdl.last_seq = seq;
+        }
+    }
+
+    awdl_ring_put(frame, len, rate, rssi, flags, chan, device_timestamp);
+    return (gAwdl.session == 2) ? 1 : 0;
+}
+
+/* iwx_tx's body on the inject queue, in step with this driver's own
+ * TX plumbing (bus_dmamap_packet, itlTxOffloadHeader, qfullmsk). */
+int ItlIwx::
+awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
+             const struct itlawdl_txreq *tr)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct iwx_tx_ring *ring;
+    struct iwx_tx_data *data;
+    struct iwx_tfh_tfd *desc;
+    struct iwx_device_cmd *cmd;
+    struct iwx_tx_cmd_gen2 *tx_gen2;
+    struct iwx_tx_cmd_gen3 *tx_gen3;
+    struct ieee80211_frame *wh;
+    const struct iwx_rate *rinfo;
+    uint64_t paddr;
+    u_int hdrlen;
+    IOPhysicalSegment *seg;
+    IOPhysicalSegment segs[IWX_TFH_NUM_TBS - 2];
+    int nsegs = 0;
+    uint32_t flags = 0, rate_n_flags = 0;
+    uint16_t offload_assist = 0;
+    uint16_t cmd_size = 0;
+    uint16_t num_tbs;
+    uint8_t type;
+    int totlen;
+    int qid = IWX_DQA_INJECT_MONITOR_QUEUE;
+    int idx;
+
+    wh = mtod(m, struct ieee80211_frame *);
+    type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
+    if (type == IEEE80211_FC0_TYPE_CTL)
+        hdrlen = sizeof(struct ieee80211_frame_min);
+    else
+        hdrlen = ieee80211_get_hdrlen(wh);
+
+    ring = &sc->txq[qid];
+    if (ring->ring_count == 0) {
+        mbuf_freem(m);
+        return ENODEV;
+    }
+    idx = (ring->cur & (ring->ring_count - 1));
+    if (ring->data[idx].m) {
+        mbuf_freem(m);
+        return ENOBUFS;
+    }
+    desc = &ring->desc[idx];
+    memset(desc, 0, sizeof(*desc));
+    data = &ring->data[idx];
+
+    cmd = &ring->cmd[idx];
+    cmd->hdr.cmd = IWX_TX_CMD;
+    cmd->hdr.group_id = 0;
+    cmd->hdr.qid = ring->qid;
+    cmd->hdr.idx = idx;
+
+    /* the request's rate, through the same mapping iwx_tx would use */
+    {
+        int min_ridx = iwx_rval2ridx(ieee80211_min_basic_rate(ic));
+        int ridx;
+        uint8_t hwrate;
+        uint32_t rate_flags;
+        uint8_t cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_TX_CMD);
+
+        if (tr->flags & 0x02) {            /* HT MCS 20 MHz */
+            ridx = iwx_mcs2ridx[in->in_ni.ni_txmcs];
+            rinfo = &iwx_rates[ridx];
+            rate_flags = iwx_get_tx_ant(sc, &in->in_ni, rinfo, type, wh);
+            rate_flags |= IWX_RATE_MCS_HT_MSK;
+            hwrate = in->in_ni.ni_txmcs & 0xff;
+            flags |= IWX_TX_FLAGS_CMD_RATE;
+        } else if (tr->rate) {             /* legacy, explicit */
+            ridx = iwx_rval2ridx(tr->rate);
+            if (ridx < min_ridx)
+                ridx = min_ridx;
+            rinfo = &iwx_rates[ridx];
+            rate_flags = iwx_get_tx_ant(sc, &in->in_ni, rinfo, type, wh);
+            if (cmdver > 8 && cmdver != IWX_FW_CMD_VER_UNKNOWN) {
+                if (IWX_RIDX_IS_CCK(ridx)) {
+                    rate_flags |= IWX_RATE_MCS_CCK_MSK;
+                    hwrate = ridx;
+                } else {
+                    rate_flags |= IWX_RATE_MCS_LEGACY_OFDM_MSK;
+                    hwrate = iwx_rate2idx(tr->rate);
+                }
+            } else if (IWX_RIDX_IS_CCK(ridx)) {
+                rate_flags |= IWX_RATE_MCS_CCK_MSK_V1;
+            }
+            flags |= IWX_TX_FLAGS_CMD_RATE;
+        } else {
+            /* rate 0: the firmware picks, as the normal data path does */
+            rinfo = &iwx_rates[min_ridx];
+            rate_flags = 0;
+            hwrate = 0;
+        }
+        if (tr->flags & 0x01)              /* expect ACK: empirical bit */
+            flags |= IWX_TX_CMD_FLG_ACK;
+        rate_n_flags = htole32(rate_flags | hwrate);
+    }
+
+    flags |= htole32(IWX_TX_FLAGS_ENCRYPT_DIS);
+    totlen = mbuf_pkthdr_len(m);
+    offload_assist = itlTxOffloadHeader(hdrlen);
+
+    if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210) {
+        tx_gen3 = (struct iwx_tx_cmd_gen3 *)cmd->data;
+        cmd_size = sizeof(*tx_gen3);
+        memset(tx_gen3, 0, cmd_size);
+        tx_gen3->len = htole16(totlen);
+        tx_gen3->offload_assist = htole32(offload_assist);
+        memcpy(((uint8_t *)tx_gen3) + sizeof(*tx_gen3), wh, hdrlen);
+        tx_gen3->flags = htole16(flags);
+        tx_gen3->rate_n_flags = htole32(rate_n_flags);
+    } else {
+        tx_gen2 = (struct iwx_tx_cmd_gen2 *)cmd->data;
+        cmd_size = sizeof(*tx_gen2);
+        memset(tx_gen2, 0, cmd_size);
+        tx_gen2->len = htole16(totlen);
+        tx_gen2->offload_assist = htole16(offload_assist);
+        memcpy(((uint8_t *)tx_gen2) + sizeof(*tx_gen2), wh, hdrlen);
+        tx_gen2->flags = htole32(flags);
+        tx_gen2->rate_n_flags = htole32(rate_n_flags);
+    }
+
+    /* Trim 802.11 header. */
+    mbuf_adj(m, hdrlen);
+
+    nsegs = bus_dmamap_packet(data->map, m, &segs[0], IWX_TFH_NUM_TBS - 2, false);
+    if (nsegs == 0) {
+        XYLog("%s: can't map mbuf (error %d)\n", DEVNAME(sc), nsegs);
+        mbuf_freem(m);
+        return ENOMEM;
+    }
+    data->m = m;
+    data->in = in;
+    data->type = type;
+
+    /* Fill TX descriptor. */
+    num_tbs = 2 + nsegs;
+    desc->num_tbs = htole16(num_tbs);
+
+    desc->tbs[0].tb_len = htole16(IWX_FIRST_TB_SIZE);
+    paddr = htole64(data->cmd_paddr);
+    memcpy(&desc->tbs[0].addr, &paddr, sizeof(paddr));
+    if (data->cmd_paddr >> 32 !=
+        (data->cmd_paddr + le32toh(desc->tbs[0].tb_len)) >> 32)
+        DPRINTF(("%s: TB0 crosses 32bit boundary\n", __func__));
+    desc->tbs[1].tb_len = htole16(_ALIGN(sizeof(struct iwx_cmd_header) +
+                                  cmd_size + hdrlen - IWX_FIRST_TB_SIZE, 4));
+    paddr = htole64(data->cmd_paddr + IWX_FIRST_TB_SIZE);
+    memcpy(&desc->tbs[1].addr, &paddr, sizeof(paddr));
+
+    /* Other DMA segments are for data payload. */
+    for (int i = 0; i < nsegs; i++) {
+        seg = &segs[i];
+        desc->tbs[i + 2].tb_len = htole16(seg->length);
+        paddr = htole64(seg->location);
+        memcpy(&desc->tbs[i + 2].addr, &paddr, sizeof(paddr));
+    }
+
+    iwx_tx_update_byte_tbl(sc, ring, idx, totlen, num_tbs);
+
+    /* Kick TX ring. */
+    ring->cur = (ring->cur + 1) % getTxQueueSize();
+    IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR, ring->qid << 16 | ring->cur);
+
+    /* Mark TX ring as full if we reach a certain threshold. */
+    if (++ring->queued > ring->hi_mark)
+        sc->qfullmsk.set(ring->qid);
+
     return 0;
 }
