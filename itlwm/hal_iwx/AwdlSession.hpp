@@ -218,7 +218,7 @@ awdl_rx_sysctl SYSCTL_HANDLER_ARGS
 
     if (!gAwdlDrv || !gAwdl.ring || !gAwdlRingLock)
         return 0;
-    if (!req->oldp) {
+    if (!req->oldptr) {
         req->oldidx = (u_int)gAwdl.ring_used;
         return 0;
     }
@@ -248,7 +248,7 @@ awdl_tx_sysctl SYSCTL_HANDLER_ARGS
     int error;
     size_t len;
 
-    if (!req->newp)
+    if (!req->newptr)
         return 0;
     len = req->newlen;
     if (len < 9 || len > sizeof(reqbuf))
