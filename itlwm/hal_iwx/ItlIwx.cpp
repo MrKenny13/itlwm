@@ -6115,6 +6115,10 @@ iwx_rx_tx_ba_notif(struct iwx_softc *sc, struct iwx_rx_packet *pkt, struct iwx_r
         qid = le16toh(ba_tfd->q_num);
         if (qid >= nitems(sc->txq) || !sc->txq[qid].ring_count)
             continue;
+        /* itlawdl v2.5: the inject queue can complete through a BA
+         * notification too; both doors count. */
+        if (qid == IWX_DQA_INJECT_MONITOR_QUEUE)
+            gAwdl.inject_done++;
         ring = &sc->txq[qid];
 
         sc->sc_tx_timer = 0;
@@ -6180,6 +6184,11 @@ iwx_rx_tx_cmd(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
     int qid = le16toh(tx_resp->tx_queue);
     if (qid >= nitems(sc->txq) || !sc->txq[qid].ring_count)
         return;
+    /* itlawdl v2.5: count the inject queue's completions — the v05/v06
+     * field runs queued thousands of frames whose fate no counter
+     * could tell (ok counts writes, not transmissions). */
+    if (qid == IWX_DQA_INJECT_MONITOR_QUEUE)
+        gAwdl.inject_done++;
     struct iwx_tx_ring *ring = &sc->txq[qid];
     struct iwx_tx_data *txd;
 
@@ -14402,13 +14411,16 @@ awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
          * firmware read it long before. Take the slot back: free the
          * mbuf, clear the descriptor, run on. No node release --
          * awdlInject never took a reference (the completion path's
-         * iwx_txd_done would release one we don't owe). */
+         * iwx_txd_done would release one we don't owe).
+         * v2.5: every take-back is counted now (inject_recycled) —
+         * how much of the session rode on recycled slots, said. */
         mbuf_freem(ring->data[idx].m);
         ring->data[idx].m = NULL;
         ring->data[idx].in = NULL;
         iwx_clear_tx_desc(sc, ring, idx);
         if (ring->queued > 0)
             ring->queued--;
+        gAwdl.inject_recycled++;
     }
     desc = &ring->desc[idx];
     memset(desc, 0, sizeof(*desc));
@@ -14459,8 +14471,14 @@ awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
             rate_flags = 0;
             hwrate = 0;
         }
-        if (tr->flags & 0x01)              /* expect ACK: empirical bit */
-            flags |= IWX_TX_CMD_FLG_ACK;
+        if (tr->flags & 0x01) {
+            /* "expect ACK": accepted for the record, but set on nothing.
+             * IWX_TX_CMD_FLG_ACK is a pre-AX210 TX-command bit; the gen3
+             * one (VER_8, a 16-bit flags word) reserves its bit 3, and the
+             * firmware ACKs unicast regardless. A reserved bit set is a
+             * frame rejected on sight at best (v2.5 removed it — every
+             * unicast this daemon ever sent carried it). */
+        }
         rate_n_flags = htole32(rate_flags | hwrate);
     }
 

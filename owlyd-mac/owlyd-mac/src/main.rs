@@ -28,11 +28,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use air::KextAir;
+use air::{Gate, KextAir};
 use netif::UtunSetup;
 use owly_airdrop::driver::receiver::ReceiverEvent;
 use owly_airdrop::proto::messages::Offer;
-use owly_awdl::{Channel, Config, MacAddr, PeerInfo, Presence, RadioConstraints};
+use owly_awdl::{Channel, Config, Ipv6Packet, MacAddr, PeerInfo, Presence, RadioConstraints};
 use sysctl::state;
 
 use tokio::io::AsyncBufReadExt;
@@ -113,12 +113,35 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
     let (peers_tx, peers_rx) = watch::channel(Vec::<PeerInfo>::new());
     // The AirDrop end binds on the utun's index and the session's
     // link-local, and the engine's open() takes the utun with it — both
-    // are said here, before the move.
+    // are said here, before the move. The loop-in end — the daemon's
+    // direct lane into the engine's netif queue — comes back out of the
+    // engine's own open(), so it waits in a box the closure fills.
     let link_local = addr.link_local();
     let scope = utun.index;
-    let running = owly_awdl::driver::spawn(cfg, move || Ok((KextAir::new()?, utun.register()?)), peers_tx)
-        .map_err(|e| io::Error::other(format!("le moteur AWDL n'a pas démarré : {e}")))?;
-    println!("== moteur AWDL lancé (canal {CHANNEL}, présence fixe). Ctrl-C pour arrêter.\n");
+    // The ramp the engine's every frame out must pass (v0.1.6: the v06
+    // run froze rx at the engine's first frames; a staged climb names
+    // the killer — one frame or the pace).
+    let gate = Arc::new(Gate::new());
+    let gate_engine = gate.clone();
+    let loop_in: Arc<std::sync::Mutex<Option<mpsc::Sender<Ipv6Packet>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let loop_in_engine = loop_in.clone();
+    let running = owly_awdl::driver::spawn(
+        cfg,
+        move || {
+            let (netif, host) = utun.register()?;
+            *loop_in_engine.lock().unwrap() = Some(host);
+            Ok((KextAir::new(gate_engine)?, netif))
+        },
+        peers_tx,
+    )
+    .map_err(|e| io::Error::other(format!("le moteur AWDL n'a pas démarré : {e}")))?;
+    let host = loop_in
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| io::Error::other("le moteur n'a pas rendu l'entrée utun"))?;
+    println!("== moteur AWDL lancé (canal {CHANNEL}, présence fixe, rampe 1→4→12 tr/s puis libre). Ctrl-C pour arrêter.\n");
 
     let failed = running.failed();
     let engine = running.progress.clone();
@@ -127,14 +150,14 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
         // Phase 2: the receiver and its announcements. A failure here (the
         // port taken, /var/db unwritable) must not take the engine down
         // with it — the session stays a diagnostic one.
-        let airdrop = match airdrop::start(scope, link_local, name).await {
+        let airdrop = match airdrop::start(scope, link_local, name, host).await {
             Ok(a) => Some(a),
             Err(e) => {
                 println!("== AirDrop n'a pas pu démarrer : {e} — le moteur continue sans lui");
                 None
             }
         };
-        monitor(peers_rx, failed, engine, airdrop.map(|a| a.events)).await
+        monitor(peers_rx, failed, engine, gate, airdrop.map(|a| a.events)).await
     });
     println!("\n== arrêt…");
     running.stop();
@@ -157,6 +180,7 @@ async fn monitor(
     mut peers: watch::Receiver<Vec<PeerInfo>>,
     mut failed: watch::Receiver<Option<String>>,
     engine: Arc<AtomicU64>,
+    gate: Arc<Gate>,
     airdrop: Option<mpsc::Receiver<ReceiverEvent>>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(10));
@@ -210,7 +234,7 @@ async fn monitor(
                     // slots: ok freezes (330 on the AX211) and err climbs
                     // by every frame the engine builds. Say it once, in
                     // the user's words, instead of a silent dead radio.
-                    let now = radio_inject();
+                    let now = sysctl::radio_inject();
                     if let (Some((ok, err)), Some((was_ok, was_err))) = (now, inject) {
                         if !warned_inject && err > was_err + 100 && ok == was_ok {
                             println!("— kext : la file d'émission sature (ok={ok}, err={err}) — c'est la limite des ~330 trames des kexts v2.2/v2.3 ; le kext v2.4 la recycle");
@@ -221,6 +245,7 @@ async fn monitor(
                 }
                 let iters = engine.load(Ordering::Relaxed);
                 println!("— moteur : {} itérations en 10 s", iters - last_iters);
+                println!("— {}", gate.report());
                 last_iters = iters;
             }
             event = async {
@@ -332,7 +357,7 @@ fn bring_cell_up(wifi: &mut Wifi) -> io::Result<()> {
         let mut samples = [0u64; 6];
         for slot in &mut samples {
             std::thread::sleep(Duration::from_secs(2));
-            *slot = radio_rx().unwrap_or(0);
+            *slot = sysctl::radio_rx().unwrap_or(0);
         }
         let report = samples
             .iter()
@@ -368,38 +393,6 @@ fn bring_cell_up(wifi: &mut Wifi) -> io::Result<()> {
         session_down_checked();
         wifi.cycle();
     }
-}
-
-/// The kext's rx counter since the session came up, off its stats.
-fn radio_rx() -> Option<u64> {
-    let s = sysctl::read_string("debug.itlawdl_stats").ok()?;
-    s.lines()
-        .next()?
-        .strip_prefix("rx=")?
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()
-}
-
-/// The kext's inject counters, off its stats.
-fn radio_inject() -> Option<(u64, u64)> {
-    let s = sysctl::read_string("debug.itlawdl_stats").ok()?;
-    let l = s.lines().find(|l| l.starts_with("inject"))?;
-    let mut ok = None;
-    let mut err = None;
-    for w in l.split_whitespace() {
-        if let Some((k, v)) = w.split_once('=') {
-            if let Ok(v) = v.parse::<u64>() {
-                match k {
-                    "ok" => ok = Some(v),
-                    "err" => err = Some(v),
-                    _ => {}
-                }
-            }
-        }
-    }
-    Some((ok?, err?))
 }
 
 /// Brings the cell up, with the kext's own words for a refusal.

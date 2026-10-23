@@ -22,7 +22,8 @@ iPhone sends: answer `o` to accept. Received files land in the directory
 you launched from, given back to your user (not root). Ctrl-C stops it
 and puts everything back.
 
-Requirements: the AirportItlwm kext of this repository (v2.4 or later,
+Requirements: the AirportItlwm kext of this repository (v2.5 or later
+for `done=`/`recycled=` in the stats; v2.4 still runs everything else,
 branch awdl-v2) loaded, and nothing else holding the radio. The
 self-signed identity persists in `/var/db/owlyd-mac`, so the phone keeps
 recognising the Mac between sessions.
@@ -35,11 +36,13 @@ recognising the Mac between sessions.
    AWDL radio active at all.
 2. Stay next to the Mac; the phone visits channel 6 a slot or two in
    sixteen, so give the announcement bursts ~15 s.
-3. What the log tells you, in order: `utun : N paquets lus` grows (the
-   announcements leaving through the interface), `tx_multicast` grows
-   (the engine carrying them as AWDL data frames), `— AirDrop : vu par
-   [..]` (an iPhone's `/Discover` answered — the name should be in its
-   list), then the ask prompt when someone taps.
+3. What the log tells you, in order: `porte TX` climbing the ramp with
+   rx moving at every step (the radio surviving our own emission),
+   `tx_multicast` growing (the engine carrying the announcements as AWDL
+   data frames), `— AirDrop : vu par [..]` (an iPhone's `/Discover`
+   answered — the name should be in its list), then the ask prompt when
+   someone taps. If `porte TX` says the radio died, the line names the
+   pace that killed it — that log is the next fix's brief.
 
 ## Layout
 
@@ -87,6 +90,22 @@ samples the rx counter every 2 s during the listen, so the next run
 says *when* the radio died: stalled during the listen is a dying cell
 (the kext's to fix), stalled exactly at the engine's first frames is
 our own TX choking the firmware's receive.
+
+The v06 run answered that question, and it was the second: rx grew
+steadily through the 12 s listen (6→10→15→19→25→29) and stood at 29 for
+the whole session — dead within the engine's first ten seconds, while
+~240 frames went out. And the announcements never left: `utun : 0
+paquets lus au total` while ~1700 left the mDNS socket, every send's
+error thrown away — macOS never routed one multicast packet into the
+utun. v0.1.6 answers both: the engine's frames now pass a ramp (1, 4,
+12 a second, ten seconds each, the kext's rx read at every boundary —
+the pace that kills the radio names the fix, and the last healthy one
+is held for the session), and the announcements ride a direct lane into
+the engine's netif queue (the socket stays for queries, and says its
+errors out loud now). itlawdl v2.5 counts the inject queue's TX
+completions (`done=`) and the v2.4 slot take-backs (`recycled=`) — with
+`ok=` they say whether the firmware ever touched what we queued — and
+stops setting a pre-AX210 ACK bit the gen3 TX command reserves.
 
 ## Credits
 

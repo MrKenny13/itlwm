@@ -120,6 +120,40 @@ pub fn read_string(name: &str) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&buf[..n]).trim().to_string())
 }
 
+/// The kext's rx counter since the session came up, off its stats' first
+/// line. The ramp watches it to tell a radio that hears from one the
+/// first frames made deaf.
+pub fn radio_rx() -> Option<u64> {
+    let s = read_string("debug.itlawdl_stats").ok()?;
+    s.lines()
+        .next()?
+        .strip_prefix("rx=")?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The kext's inject counters (ok, err), off its stats.
+pub fn radio_inject() -> Option<(u64, u64)> {
+    let s = read_string("debug.itlawdl_stats").ok()?;
+    let l = s.lines().find(|l| l.starts_with("inject"))?;
+    let mut ok = None;
+    let mut err = None;
+    for w in l.split_whitespace() {
+        if let Some((k, v)) = w.split_once('=') {
+            if let Ok(v) = v.parse::<u64>() {
+                match k {
+                    "ok" => ok = Some(v),
+                    "err" => err = Some(v),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some((ok?, err?))
+}
+
 /// The session sysctl's states, as the kext reads them back.
 pub mod state {
     pub const OFF: i32 = 0;

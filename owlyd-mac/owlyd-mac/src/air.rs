@@ -31,6 +31,13 @@
 //!   the frame — the kext would have counted it in `inject_err`
 //!   anyway, and the engine has no queue-full signal to act on.
 //!
+//! v0.1.6: the v05/v06 field runs both passed the 12 s listening check
+//! and then watched rx stand still from the engine's first frames out —
+//! 24 a second, from zero, with no way to tell which of the two killed
+//! the radio. Every frame now passes a ramp ([`Gate`]): 1, 4, 12 a
+//! second, ten seconds each, the kext's rx counter read at every
+//! boundary, the ceiling that survived kept for the rest of the session.
+//!
 //! TX requests, `debug.itlawdl_tx`: an 8-byte header then the frame —
 //! u8 ver=2, u8 flags (bit0 expect ack, bit1 ht mcs), u8 rate (same
 //! coding as RX), u8 pad, u16 frame_len (LE), u16 rsv. A write the kext
@@ -38,6 +45,8 @@
 //! radio's to log, not to retry.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -68,16 +77,162 @@ const CHANNEL: usize = 1024;
 /// How many injection requests may wait for the writer at once.
 const TX_CHANNEL: usize = 256;
 
+/// The injection ladder: (frames a second the gate lets by, seconds the
+/// step lasts). The last one stays forever. The v06 field run froze rx
+/// at the very moment the engine's first frames went out — 24 a second
+/// from zero — and only a staged climb can say which of the two it was:
+/// one frame is poison (the kext's inject path itself, its queue to
+/// change), or twenty-four a second choke the firmware (a pace to hold).
+const RAMP: [(u64, u64); 4] = [(1, 10), (4, 10), (12, 10), (u64::MAX, 0)];
+/// A step's rx must grow by at least this to count as hearing: beacons
+/// alone bring ~25 in ten seconds on channel 6, a deaf radio exactly 0.
+const STILL_ALIVE: u64 = 2;
+
+/// The gate every frame out has to pass: one ceiling at a time, each
+/// step judged by the kext's own rx counter before the next opens. A
+/// step that leaves rx standing still closes the ladder at the last pace
+/// the radio survived — and says so — so the session stays a useful one
+/// (peers, mDNS in) at whatever the firmware tolerates.
+pub struct Gate {
+    ladder: Mutex<Ladder>,
+    /// Frames let through and eaten, since the engine started.
+    allowed: AtomicU64,
+    eaten: AtomicU64,
+}
+
+struct Ladder {
+    step: usize,
+    since: Instant,
+    rx_at_start: Option<u64>,
+    /// The 1 s budget window of the current ceiling.
+    window: Instant,
+    budget: u64,
+    /// Set once a step killed the radio: the ceiling to keep, 0 to stay
+    /// silent.
+    held: Option<u64>,
+    /// One line of state for the monitor's ticker.
+    state: String,
+}
+
+impl Gate {
+    pub fn new() -> Gate {
+        let rx = sysctl::radio_rx();
+        Gate {
+            ladder: Mutex::new(Ladder {
+                step: 0,
+                since: Instant::now(),
+                rx_at_start: rx,
+                window: Instant::now(),
+                budget: 0,
+                held: None,
+                state: "palier 1 tr/s".into(),
+            }),
+            allowed: AtomicU64::new(0),
+            eaten: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether this frame may go out now. Called from the engine's
+    /// thread for every frame it builds — including the ones it eats.
+    pub fn admit(&self, now: Instant) -> bool {
+        let mut l = self.ladder.lock().unwrap();
+        if now.saturating_duration_since(l.window) >= Duration::from_secs(1) {
+            l.window = now;
+            l.budget = 0;
+        }
+        if l.held.is_none() && RAMP[l.step].1 > 0
+            && now.saturating_duration_since(l.since) >= Duration::from_secs(RAMP[l.step].1)
+        {
+            let rx = sysctl::radio_rx();
+            let grew = match (rx, l.rx_at_start) {
+                (Some(now), Some(was)) => now.saturating_sub(was) >= STILL_ALIVE,
+                // The stats went away: the kext (or its session) is in no
+                // state to judge anything — climb on, the engine's own
+                // failure channel will say why.
+                _ => true,
+            };
+            if !grew {
+                let last = if l.step == 0 { 0 } else { RAMP[l.step - 1].0 };
+                l.held = Some(last);
+                let said = if last == 0 {
+                    l.state = "émission coupée (la radio meurt à la première trame)".into();
+                    "== porte TX : la radio n'a plus rien reçu dès 1 trame/s — la première injection \
+                     l'assourdit. J'arrête d'émettre pour cette session ; colle-moi ce log : le \
+                     prochain pas est côté kext (file TVQM)"
+                        .to_string()
+                } else {
+                    l.state =
+                        format!("tenue à {last} tr/s (la radio est morte à {})", RAMP[l.step].0);
+                    format!(
+                        "== porte TX : la radio n'a plus rien reçu à {} tr/s — je m'arrête à \
+                         {last} tr/s pour la suite de la session (la réception et les pairs \
+                         continuent)",
+                        RAMP[l.step].0
+                    )
+                };
+                println!("{said}");
+            } else {
+                let delta = match (rx, l.rx_at_start) {
+                    (Some(now), Some(was)) => format!("+{}", now.saturating_sub(was)),
+                    _ => "?".into(),
+                };
+                l.step += 1;
+                l.since = now;
+                l.rx_at_start = rx;
+                let said = match RAMP[l.step].0 {
+                    u64::MAX => {
+                        l.state = "rythme libre".into();
+                        "rythme libre".to_string()
+                    }
+                    n => {
+                        l.state = format!("palier {n} tr/s");
+                        format!("{n} tr/s")
+                    }
+                };
+                println!(
+                    "== porte TX : la radio tient (rx {delta} en {} s) — je monte à {said}",
+                    RAMP[l.step - 1].1
+                );
+            }
+        }
+        let ceiling = match l.held {
+            Some(c) => c,
+            None => RAMP[l.step].0,
+        };
+        if l.budget >= ceiling {
+            self.eaten.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        l.budget += 1;
+        self.allowed.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// The monitor's line: where the ladder stands, what went through.
+    pub fn report(&self) -> String {
+        let l = self.ladder.lock().unwrap();
+        format!(
+            "porte TX : {} | passées {} mangées {}",
+            l.state,
+            self.allowed.load(Ordering::Relaxed),
+            self.eaten.load(Ordering::Relaxed)
+        )
+    }
+}
+
 /// The kext's sysctls as a radio: a reader thread for the frames coming
-/// in, a writer thread for the frames going out.
+/// in, a writer thread for the frames going out, and the ramp every
+/// outgoing frame must pass.
 pub struct KextAir {
     rx: mpsc::Receiver<Received>,
     tx: mpsc::Sender<Vec<u8>>,
+    gate: Arc<Gate>,
 }
 
 impl KextAir {
-    /// Spawns both threads; their channels are the engine's ends.
-    pub fn new() -> io::Result<KextAir> {
+    /// Spawns both threads; their channels are the engine's ends. The
+    /// gate is shared with the monitor, which reports it every 10 s.
+    pub fn new(gate: Arc<Gate>) -> io::Result<KextAir> {
         let (rx_tx, rx) = mpsc::channel(CHANNEL);
         let (tx_tx, tx_rx) = mpsc::channel(TX_CHANNEL);
         thread::Builder::new()
@@ -88,7 +243,7 @@ impl KextAir {
             .name("itlawdl-tx".into())
             .spawn(move || write_wire(tx_rx))
             .map_err(|e| io::Error::other(format!("le fil d'émission du kext : {e}")))?;
-        Ok(KextAir { rx, tx: tx_tx })
+        Ok(KextAir { rx, tx: tx_tx, gate })
     }
 }
 
@@ -175,6 +330,12 @@ impl Air for KextAir {
     }
 
     fn send(&mut self, frame: Frame) -> Result<(), Frame> {
+        if !self.gate.admit(Instant::now()) {
+            // The ramp ate it. A stale PSF is worthless by its next try
+            // anyway (the driver drops them the same way), and the mDNS
+            // burst sends 64 of each — a few eaten change nothing.
+            return Ok(());
+        }
         let expect_ack = (!frame.no_ack) as u8;
         let (flags, rate) = match frame.rate {
             TxRate::Legacy(r) => (expect_ack, r),

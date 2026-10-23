@@ -133,9 +133,19 @@ impl UtunSetup {
         Ok(UtunSetup { fd, name, index })
     }
 
-    /// Spawns the utun's reader thread; its channel is the engine's end.
-    /// May be called from any thread — nothing here touches a runtime.
-    pub fn register(self) -> io::Result<Utun> {
+    /// Spawns the utun's reader thread; its channel is the engine's end,
+    /// and a second copy of the channel's sending end comes back for the
+    /// daemon itself — the loop-in lane. May be called from any thread —
+    /// nothing here touches a runtime.
+    ///
+    /// v0.1.6: the loop-in lane exists because the v06 field run sent
+    /// ~1700 mDNS announcements through the socket while the utun read
+    /// "0 paquets lus au total" — macOS never routed one multicast
+    /// packet into utun9, and each send's error was thrown away. The
+    /// AirDrop end now pushes its announcements straight into this
+    /// channel, as the kernel would have; the socket stays for the
+    /// queries and answers, and its send errors are said out loud now.
+    pub fn register(self) -> io::Result<(Utun, mpsc::Sender<Ipv6Packet>)> {
         let (tx, rx) = mpsc::channel(PACKETS);
         // The reader gets its own descriptor: the fd stays non-blocking
         // (writes must never stall the engine), so the reader simply
@@ -144,17 +154,21 @@ impl UtunSetup {
             io::Error::other(format!("{} : pas de second descripteur : {e}", self.name))
         })?;
         let name = self.name.clone();
+        let reader_tx = tx.clone();
         thread::Builder::new()
             .name("utun-rx".into())
-            .spawn(move || read_utun(read_fd, name, tx))
+            .spawn(move || read_utun(read_fd, name, reader_tx))
             .map_err(|e| io::Error::other(format!("le fil de lecture utun : {e}")))?;
-        Ok(Utun {
-            fd: self.fd,
-            rx,
-            name: self.name,
-            index: self.index,
-            out: Vec::with_capacity(1500),
-        })
+        Ok((
+            Utun {
+                fd: self.fd,
+                rx,
+                name: self.name,
+                index: self.index,
+                out: Vec::with_capacity(1500),
+            },
+            tx,
+        ))
     }
 }
 

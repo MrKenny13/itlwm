@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "owlyd-mac"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "getrandom 0.3.4",
  "libc",

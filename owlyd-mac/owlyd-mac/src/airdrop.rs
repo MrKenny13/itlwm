@@ -16,16 +16,28 @@
 //! for the kernel to hand to the socket that joined `ff02::fb` on it. The
 //! responder therefore needs no hook of its own in the engine: bind, join,
 //! announce, answer, exactly as on Linux's `awdl0`.
+//!
+//! v0.1.6, one lane more: the v06 field run proved macOS never routed a
+//! single multicast packet into the utun ("0 paquets lus au total" while
+//! ~1700 announcements left the socket, every send's error thrown away).
+//! The socket stays — queries arrive on it and answers leave on it, and
+//! its send errors are said out loud now — but the announcements also
+//! ride the loop-in lane: the same bursts, pushed straight into the
+//! engine's netif channel, as if the kernel had routed them. A phone that
+//! receives both copies has merely one announcement more of the 64 each
+//! burst sends anyway.
 
 use std::io;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use owly_airdrop::driver::mdns::{Mdns, Registration};
 use owly_airdrop::driver::receiver::{Options, Receiver, ReceiverEvent};
 use owly_airdrop::driver::tls::{rustls, Identity};
-use owly_airdrop::proto::mdns::{service_id, Burst, Service, RECEIVER_FLAGS};
+use owly_airdrop::proto::mdns::{service_id, Announcer, Burst, MDNS_GROUP, MDNS_PORT, Service, RECEIVER_FLAGS};
 use owly_airdrop::proto::receiver::Config;
+use owly_awdl::Ipv6Packet;
 
 use tokio::sync::mpsc;
 
@@ -61,7 +73,12 @@ pub struct AirDrop {
 /// `[link-local]:8770`, and the `_airdrop._tcp` records announced in
 /// bursts. `scope` is the utun's interface index; `addr` its link-local
 /// address; `name` what the share sheet will show (the computer name).
-pub async fn start(scope: u32, addr: Ipv6Addr, name: &str) -> io::Result<AirDrop> {
+pub async fn start(
+    scope: u32,
+    addr: Ipv6Addr,
+    name: &str,
+    host: mpsc::Sender<Ipv6Packet>,
+) -> io::Result<AirDrop> {
     // The crypto provider must be in before any rustls builder; a second
     // install (tests, a second start) is not an error worth failing on.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -95,9 +112,38 @@ pub async fn start(scope: u32, addr: Ipv6Addr, name: &str) -> io::Result<AirDrop
     };
     let announce = Mdns::new(scope)
         .with_burst(Some(ANNOUNCE))
-        .register(service)
+        .register(service.clone())
         .await
         .map_err(|e| io::Error::other(format!("le répondeur mDNS sur l'interface {scope} : {e}")))?;
+
+    // The loop-in lane: the same bursts, straight into the engine — the
+    // ride the kernel refuses to give the socket on this utun (v06: zero
+    // packets ever read off it). The socket keeps its own burst for the
+    // day the kernel carries it; a phone that sees both copies of an
+    // announcement has one more of the 64 a burst sends anyway.
+    let packet = Ipv6Packet::from_ip(ipv6_udp(
+        addr,
+        MDNS_GROUP,
+        MDNS_PORT,
+        MDNS_PORT,
+        &service.announcement(),
+    ))
+    .ok_or_else(|| io::Error::other("l'annonce ne se construit pas (adresse ?)"))?;
+    tokio::spawn(async move {
+        let mut announcer = Announcer::new(Some(ANNOUNCE), Instant::now());
+        while let Some(at) = announcer.next_timer() {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+            if announcer.on_timer(Instant::now())
+                && host.send(packet.clone()).await.is_err()
+            {
+                return; // the engine is gone
+            }
+        }
+    });
+    println!(
+        "== annonces _airdrop._tcp : chemin direct vers le moteur ouvert (64 copies par salve, \
+         tous les 3 s)"
+    );
 
     println!(
         "== AirDrop : « {name} » (id {id}) annoncé sur [{addr}%{scope}]:{AIRDROP_PORT}, \
@@ -107,6 +153,57 @@ pub async fn start(scope: u32, addr: Ipv6Addr, name: &str) -> io::Result<AirDrop
         events,
         _announce: announce,
     })
+}
+
+/// One UDP datagram inside IPv6, as the kernel would have built it for a
+/// link-local multicast: hop limit 255 (mDNS's link-local rule), and the
+/// checksum IPv6 refuses to travel without (RFC 8200 §8.1 — UDP over
+/// IPv6 has no checksum-less option, so the loop-in lane carries its
+/// own).
+fn ipv6_udp(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+    const UDP: u8 = 17;
+    let ulen = (8 + payload.len()) as u16;
+    let mut udp = Vec::with_capacity(8 + payload.len());
+    udp.extend_from_slice(&sport.to_be_bytes());
+    udp.extend_from_slice(&dport.to_be_bytes());
+    udp.extend_from_slice(&ulen.to_be_bytes());
+    udp.extend_from_slice(&[0, 0]); // checksum, filled below
+    udp.extend_from_slice(payload);
+    let sum = internet_checksum(src, dst, UDP, &udp);
+    let mut pkt = Vec::with_capacity(40 + udp.len());
+    pkt.extend_from_slice(&[0x60, 0, 0, 0]);
+    pkt.extend_from_slice(&ulen.to_be_bytes());
+    pkt.push(UDP);
+    pkt.push(255); // hop limit: link-local multicast wants 255
+    pkt.extend_from_slice(&src.octets());
+    pkt.extend_from_slice(&dst.octets());
+    pkt.extend_from_slice(&udp);
+    let at = pkt.len() - udp.len() + 6;
+    pkt[at..at + 2].copy_from_slice(&sum.to_be_bytes());
+    pkt
+}
+
+/// The Internet checksum over the IPv6 pseudo-header and `message` —
+/// owly-awdl carries the same one for its ICMPv6; this is the daemon's
+/// copy for the lane that builds its own packets.
+fn internet_checksum(src: Ipv6Addr, dst: Ipv6Addr, next: u8, message: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut add = |b: &[u8]| {
+        for pair in b.chunks(2) {
+            let hi = pair[0] as u32;
+            let lo = pair.get(1).copied().unwrap_or(0) as u32;
+            sum += (hi << 8) | lo;
+        }
+    };
+    add(&src.octets());
+    add(&dst.octets());
+    add(&(message.len() as u32).to_be_bytes());
+    add(&[0, 0, 0, next]);
+    add(message);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// A host label fit for `<label>.local`: mDNS host labels are the letters,
@@ -220,5 +317,26 @@ mod tests {
         assert_eq!(host_label(""), "Mac");
         let long = "M".repeat(200);
         assert_eq!(host_label(&long).len(), 63);
+    }
+
+    /// The loop-in lane's packet, whole: the engine's own parser takes it
+    /// (link-local source, `33:33:00:00:00:fb` from the group), the hop
+    /// limit is mDNS's 255, and a correct checksum sums, with itself, to
+    /// zero — the property RFC 1071 hangs on it.
+    #[test]
+    fn the_loop_in_packet_is_a_packet() {
+        let src: Ipv6Addr = "fe80::b0d9:efff:fe64:a87c".parse().unwrap();
+        let pkt = ipv6_udp(src, MDNS_GROUP, MDNS_PORT, MDNS_PORT, b"an mDNS announcement");
+        let parsed = Ipv6Packet::from_ip(pkt.clone()).expect("the engine's parser takes it");
+        // `33:33:00:00:00:fb` for the group, and the link-local folds back
+        // to the AWDL address it was made from (the 0x02 bit restored).
+        assert_eq!(parsed.src.0, [0xb2, 0xd9, 0xef, 0x64, 0xa8, 0x7c]);
+        assert_eq!(parsed.dst.0, [0x33, 0x33, 0, 0, 0, 0xfb]);
+        assert_eq!(pkt[7], 255, "hop limit");
+        assert_eq!(u16::from_be_bytes([pkt[4], pkt[5]]), 28, "payload length");
+        // A correct UDP checksum over the pseudo-header sums to zero with
+        // itself (the checksum field included, as it travels).
+        let udp = &pkt[40..];
+        assert_eq!(internet_checksum(src, MDNS_GROUP, 17, udp), 0);
     }
 }

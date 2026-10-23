@@ -112,6 +112,14 @@ impl Mdns {
         let announcement = service.announcement();
         let mut announcer = Announcer::new(self.burst, Instant::now());
         let mut buf = vec![0; mdns::MAX_MESSAGE];
+        // macOS port, v0.1.6: this socket's sends were the v06 field run's
+        // silent failure — ~1700 announcements "sent", not one ever read
+        // off the utun, every error thrown away with `let _`. They are
+        // said out loud now (the first, then every 128th): a send that
+        // never fails means the kernel carries them, one that always does
+        // means only the daemon's direct lane rides.
+        let mut send_errs: u64 = 0;
+        let mut reply_errs: u64 = 0;
         loop {
             let next = announcer.next_timer();
             let wait = next.map(|at| at.saturating_duration_since(Instant::now()));
@@ -119,7 +127,14 @@ impl Mdns {
                 _ = &mut stopped => break,
                 () = sleep(wait.unwrap_or_default()), if wait.is_some() => {
                     if announcer.on_timer(Instant::now()) {
-                        let _ = socket.send_to(&announcement, group).await;
+                        if let Err(e) = socket.send_to(&announcement, group).await {
+                            send_errs += 1;
+                            if send_errs == 1 || send_errs % 128 == 0 {
+                                tracing::warn!(
+                                    "mDNS socket : un envoi vers le groupe a rendu {e} ({send_errs} échecs) — les annonces passent aussi par le chemin direct du démon"
+                                );
+                            }
+                        }
                     }
                 }
                 received = socket.recv_from(&mut buf) => {
@@ -130,7 +145,12 @@ impl Mdns {
                     let to = if reply.unicast { from } else { group };
                     // RFC 6762 §6: a short random delay for shared records
                     // isn't needed with one responder per link.
-                    let _ = socket.send_to(&reply.message, to).await;
+                    if let Err(e) = socket.send_to(&reply.message, to).await {
+                        reply_errs += 1;
+                        if reply_errs == 1 {
+                            tracing::warn!("mDNS socket : une réponse a rendu {e}");
+                        }
+                    }
                 }
             }
         }

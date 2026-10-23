@@ -12,6 +12,15 @@
 //  and an enable() that fails now fails the session instead of
 //  leaving a deaf cell up.
 //
+//  v2.5: the inject stats grew `done=` (TX completions seen for the
+//  inject queue) and `recycled=` (slots taken back the v2.4 way). The
+//  v05/v06 field runs both watched rx die at the engine's first frames
+//  while `ok=` climbed -- with `done=` beside them the next log says
+//  whether the firmware ever touched what we queued. Also: the TX
+//  request's "expect ACK" bit no longer sets IWX_TX_CMD_FLG_ACK -- that
+//  bit belongs to the pre-AX210 TX command's flag word, and the gen3
+//  one reserves its bit 3; the firmware ACKs unicast on its own.
+//
 //  With Wi-Fi turned OFF in macOS, `sysctl -w debug.itlawdl=2` restarts
 //  the firmware as a "cell" on channel 6: a PIBSS MAC context (Intel's
 //  pseudo-IBSS; a plain IBSS one receives nothing on this firmware) on
@@ -79,8 +88,12 @@ struct awdl_session_state {
     uint8_t peer[6];        /* last AWDL peer address seen */
     int peer_rssi;
 
-    /* inject accounting */
+    /* inject accounting. done counts TX completions seen for the
+     * inject queue (iwx_rx_tx_cmd / iwx_rx_tx_ba_notif) — the v05/v06
+     * runs never saw one, which no counter could say. recycled counts
+     * the slots awdlTxInject took back the v2.4 way. */
     uint64_t inject_ok, inject_err, inject_bytes;
+    uint64_t inject_done, inject_recycled;
 
     /* rx ring: length-prefixed records, drained by debug.itlawdl_rx */
     uint8_t *ring;
@@ -209,7 +222,7 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         "rx=%llu bytes=%llu dropped=%llu dup=%llu\n"
         "awdl action=%llu psf=%llu mif=%llu other=%llu data=%llu data_bytes=%llu\n"
         "peer %02x:%02x:%02x:%02x:%02x:%02x rssi=%d\n"
-        "inject ok=%llu err=%llu bytes=%llu\n"
+        "inject ok=%llu err=%llu bytes=%llu done=%llu recycled=%llu\n"
         "state=%d cell=%d(want %d) channel=%d\n",
         gAwdl.rx, gAwdl.rx_bytes, gAwdl.rx_dropped, gAwdl.dup,
         gAwdl.action, gAwdl.psf, gAwdl.mif, gAwdl.other_action,
@@ -218,6 +231,7 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         gAwdl.peer[3], gAwdl.peer[4], gAwdl.peer[5],
         gAwdl.peer_rssi,
         gAwdl.inject_ok, gAwdl.inject_err, gAwdl.inject_bytes,
+        gAwdl.inject_done, gAwdl.inject_recycled,
         gAwdl.session, gAwdl.cell, gAwdl.cell_wanted, gAwdl.channel);
     if (n < 0)
         return EIO;
