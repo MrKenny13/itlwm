@@ -7,7 +7,8 @@
 //  probe's pattern (AwdlProbe.hpp).
 //
 //  With Wi-Fi turned OFF in macOS, `sysctl -w debug.itlawdl=2` restarts
-//  the firmware as a "cell" on channel 6: a (pseudo-)IBSS MAC context on
+//  the firmware as a "cell" on channel 6: a PIBSS MAC context (Intel's
+//  pseudo-IBSS; a plain IBSS one receives nothing on this firmware) on
 //  AWDL's BSSID 00:25:00:ff:94:73 with the station's own address, which
 //  makes the firmware ACK the peer's unicast data frames, the way owly
 //  does on Linux with an ad-hoc cell. `debug.itlawdl=1` is the v1-style
@@ -18,7 +19,7 @@
 //
 //  sysctls (the contract with tools/itlawdlctl.c):
 //    debug.itlawdl        int rw   0 stop, 1 listen, 2 cell
-//    debug.itlawdl_cell   int rw   pin fw mac type: 0 auto (IBSS),
+//    debug.itlawdl_cell   int rw   pin fw mac type: 0 auto (PIBSS),
 //                                  4 ibss, 3 pibss, 2 listener
 //    debug.itlawdl_stats  string   counters
 //    debug.itlawdl_rx     opaque   drains received frames: 16-byte
@@ -57,7 +58,7 @@ struct awdl_session_state {
     /* bookkeeping */
     int session;            /* 0 off, 1 listen, 2 cell (mirrors sc_awdl_session) */
     int cell;               /* fw mac type in use: 2 LISTENER, 3 PIBSS, 4 IBSS */
-    int cell_wanted;        /* 0 auto (IBSS), else pinned 2/3/4 */
+    int cell_wanted;        /* 0 auto (PIBSS), else pinned 2/3/4 */
     int channel;            /* ieee channel, 6 */
     volatile int entering;  /* set while awdlSessionSetGated brings it up */
     int state;              /* what debug.itlawdl reads */
@@ -266,10 +267,10 @@ awdl_tx_sysctl SYSCTL_HANDLER_ARGS
 
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_state_sysctl, "I",
-            "itlwm AWDL session: 0 stop, 1 listen (v1), 2 cell (IBSS on AWDL's BSSID, ACKs + injection)");
+            "itlwm AWDL session: 0 stop, 1 listen (v1), 2 cell (PIBSS on AWDL's BSSID, ACKs + injection)");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_cell, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_cell_sysctl, "I",
-            "pin fw mac type for the next session: 0 auto (ibss), 4 ibss, 3 pibss, 2 listener");
+            "pin fw mac type for the next session: 0 auto (pibss), 4 ibss, 3 pibss, 2 listener");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_stats_sysctl, "A",
             "itlwm AWDL session counters");

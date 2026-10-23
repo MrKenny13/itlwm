@@ -14050,12 +14050,18 @@ awdlSessionSetGated(int target, int cell_wanted)
     struct iwx_node *in = (struct iwx_node *)ic->ic_bss;
     int cell, s;
 
+    if (target == 0) {
+        /* v2.2: `down` at rest also clears a stale error state, so the
+         * sysctl reads 0 again instead of the last refusal's -1. */
+        if (gAwdl.session)
+            awdlSessionLeaveGated();
+        gAwdl.state = AWDL_S_OFF;
+        return AWDL_S_OFF;
+    }
     if (target == gAwdl.session)
         return gAwdl.state;
     if (gAwdl.session)
         awdlSessionLeaveGated();
-    if (target == 0)
-        return AWDL_S_OFF;
 
     if (sc->sc_flags & IWX_FLAG_SHUTDOWN) {
         XYLog("itlawdl: driver is shutting down\n");
@@ -14085,7 +14091,13 @@ awdlSessionSetGated(int target, int cell_wanted)
 
     cell = 0;
     if (target == 2)
-        cell = cell_wanted ? cell_wanted : IWX_FW_MAC_TYPE_IBSS;
+        /* v2.2: PIBSS is the default cell. On this firmware (so-a0-gf4-a0,
+         * AX211) a plain IBSS context receives NOTHING even with PROMISC
+         * -- the peer's AWDL frames never come up -- while PIBSS delivers
+         * them exactly like the listener does (hardware-validated
+         * 2026-10-24: action/psf counters alive, peer 8e:e5:.. visible).
+         * IBSS stays selectable with `itlawdlctl cell 4`. */
+        cell = cell_wanted ? cell_wanted : IWX_FW_MAC_TYPE_PIBSS;
 
     /* the node's shape: the cell is HT20 (owly); the listener stays NOHT.
      * iwx_auth keeps it for the cell (its monitor branch) and resets it
