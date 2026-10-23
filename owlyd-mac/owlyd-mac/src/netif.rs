@@ -10,16 +10,36 @@
 //! the utun kernel control, `CTLIOCGINFO` for its ID, `connect` on a
 //! free unit. It lasts as long as the descriptor. The address, MTU and
 //! up state go through ifconfig, which root runs.
+//!
+//! v0.1.3: the reads no longer go through AsyncFd. The v03 field run
+//! froze exactly as a cached-readiness spin would: the engine sent its
+//! first MIF (before the loop), then nothing — no STATS line ever, not
+//! one peer from a ring the reader kept feeding, not even the kernel's
+//! own DAD packets read off the utun — with the thread alive at the
+//! stop. AsyncFd's canonical pattern calls `clear_ready()` in the
+//! WouldBlock arm; ours didn't, so one spurious readiness on the
+//! kernel-control socket (kqueue reports these) would loop
+//! `readable() → EAGAIN → readable()` forever — and inside the driver's
+//! `biased` select, that one branch starves timers, peers, everything.
+//! The utun now has a reader thread of its own, the pattern the kext
+//! ring already uses and the field already proved: a non-blocking read,
+//! a 2 ms pause when it comes back empty, packets handed to the engine
+//! over a channel. The engine's end is a channel receive — a wedged fd
+//! can no longer take the node down — and the reader says it is alive
+//! every 10 s, as the ring's reader does. Writes stay inline and
+//! non-blocking: EAGAIN drops the packet, as a full queue would.
 
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use owly_awdl::driver::Netif;
 use owly_awdl::{Ipv6Packet, MacAddr};
 
-use tokio::io::unix::AsyncFd;
+use tokio::sync::mpsc;
 
 const AF_SYSTEM: libc::c_int = 32;
 const SYSPROTO_CONTROL: libc::c_int = 2;
@@ -35,6 +55,12 @@ const UTUN_CONTROL: &[u8] = b"com.apple.net.utun_control\0";
 const AF_INET6: u32 = 30;
 /// `awdl0`'s MTU on Linux, and ours.
 const MTU: u32 = 1450;
+/// How long the reader waits between reads that came back empty.
+const EMPTY_POLL: Duration = Duration::from_millis(2);
+/// How often the reader says it is alive.
+const HEARTBEAT: Duration = Duration::from_secs(10);
+/// How many packets may wait for the engine at once.
+const PACKETS: usize = 256;
 
 #[repr(C)]
 struct CtlInfo {
@@ -52,7 +78,7 @@ struct SockaddrCtl {
     sc_reserved: [libc::c_uint; 5],
 }
 
-/// A utun opened and configured, ready to register with a runtime.
+/// A utun opened and configured, ready to hand to the engine's thread.
 pub struct UtunSetup {
     fd: OwnedFd,
     pub name: String,
@@ -107,75 +133,48 @@ impl UtunSetup {
         Ok(UtunSetup { fd, name, index })
     }
 
-    /// Registers the descriptor with the current runtime: the step that
-    /// must run on the driver's thread.
+    /// Spawns the utun's reader thread; its channel is the engine's end.
+    /// May be called from any thread — nothing here touches a runtime.
     pub fn register(self) -> io::Result<Utun> {
-        #[allow(unsafe_code)]
-        // SAFETY: AsyncFd::register takes what it registers.
-        let fd = unsafe { AsyncFd::register(self.fd) }.map_err(|e| io::Error::other(e.to_string()))?;
+        let (tx, rx) = mpsc::channel(PACKETS);
+        // The reader gets its own descriptor: the fd stays non-blocking
+        // (writes must never stall the engine), so the reader simply
+        // waits between empty reads, like the kext ring's reader does.
+        let read_fd = dup_fd(&self.fd).map_err(|e| {
+            io::Error::other(format!("{} : pas de second descripteur : {e}", self.name))
+        })?;
+        let name = self.name.clone();
+        thread::Builder::new()
+            .name("utun-rx".into())
+            .spawn(move || read_utun(read_fd, name, tx))
+            .map_err(|e| io::Error::other(format!("le fil de lecture utun : {e}")))?;
         Ok(Utun {
-            fd,
+            fd: self.fd,
+            rx,
             name: self.name,
             index: self.index,
-            buf: vec![0; 64 * 1024],
             out: Vec::with_capacity(1500),
         })
     }
 }
 
-/// The registered end: what the driver runs against.
+/// The engine's end: a channel in, a non-blocking write out.
 pub struct Utun {
-    fd: AsyncFd<OwnedFd>,
+    fd: OwnedFd,
+    rx: mpsc::Receiver<Ipv6Packet>,
     pub name: String,
     /// Phase 2 binds its mDNS socket to the interface by this.
     #[allow(dead_code)]
     pub index: u32,
-    buf: Vec<u8>,
     out: Vec<u8>,
 }
 
 impl Netif for Utun {
     async fn recv(&mut self) -> io::Result<Ipv6Packet> {
-        loop {
-            let mut guard = self.fd.readable().await?;
-            #[allow(unsafe_code)]
-            // SAFETY: the buffer is `buf.len()` long and outlives the call.
-            let read = guard.try_io(|fd| {
-                Ok(unsafe {
-                    libc::read(
-                        fd.as_raw_fd(),
-                        self.buf.as_mut_ptr().cast(),
-                        self.buf.len(),
-                    )
-                })
-            });
-            match read {
-                Ok(Ok(n)) if n > 4 => {
-                    let family = u32::from_ne_bytes(self.buf[0..4].try_into().unwrap());
-                    if family != AF_INET6 {
-                        continue; // an AF_INET prefix; not ours
-                    }
-                    if let Some(packet) = Ipv6Packet::from_ip(self.buf[4..n as usize].to_vec()) {
-                        return Ok(packet);
-                    }
-                    // A malformed packet: dropped, as a full queue would.
-                }
-                Ok(Ok(0)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("{} est partie", self.name),
-                    ));
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    return Err(io::Error::new(
-                        e.kind(),
-                        format!("{} a lâché : {e}", self.name),
-                    ));
-                }
-                Err(_would_block) => {}
-            }
-        }
+        self.rx
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::other("le fil de lecture utun s'est arrêté"))
     }
 
     fn deliver(&mut self, packet: Ipv6Packet) {
@@ -186,7 +185,7 @@ impl Netif for Utun {
         // SAFETY: the buffer is `out.len()` long and outlives the call.
         let wrote = unsafe {
             libc::write(
-                self.fd.get_ref().as_raw_fd(),
+                self.fd.as_raw_fd(),
                 self.out.as_ptr().cast(),
                 self.out.len(),
             )
@@ -196,9 +195,71 @@ impl Netif for Utun {
             tracing::debug!("{} a refusé un paquet", self.name);
         }
     }
+}
 
-    fn peer_up(&mut self, _mac: MacAddr) {}
-    fn peer_down(&mut self, _mac: MacAddr) {}
+/// The utun reader thread's whole life: read the descriptor, keep the
+/// IPv6 packets, hand them to the engine, say it is alive, and leave
+/// when the engine is gone — or the descriptor under it.
+fn read_utun(fd: OwnedFd, name: String, tx: mpsc::Sender<Ipv6Packet>) {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut packets: u64 = 0;
+    let mut beat = Instant::now();
+    tracing::info!("utun : lecteur démarré ({name})");
+    loop {
+        if tx.is_closed() {
+            return; // the engine is gone
+        }
+        #[allow(unsafe_code)]
+        // SAFETY: the buffer is `buf.len()` long and outlives the call.
+        let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EAGAIN) {
+                // Nothing for now — same pace as the ring's reader.
+                thread::sleep(EMPTY_POLL);
+                if beat.elapsed() >= HEARTBEAT {
+                    tracing::info!("utun : {packets} paquets lus au total");
+                    beat = Instant::now();
+                }
+                continue;
+            }
+            tracing::warn!("utun : le descripteur a rendu {e} — j'arrête");
+            return;
+        }
+        if n == 0 {
+            tracing::warn!("utun : le descripteur est parti — j'arrête");
+            return;
+        }
+        if n > 4 {
+            let family = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+            if family == AF_INET6 {
+                if let Some(packet) = Ipv6Packet::from_ip(buf[4..n as usize].to_vec()) {
+                    if tx.blocking_send(packet).is_err() {
+                        return; // the engine is gone
+                    }
+                    packets += 1;
+                }
+                // A malformed packet: dropped, as a full queue would.
+            }
+            // An AF_INET prefix or another family: not ours.
+        }
+        if beat.elapsed() >= HEARTBEAT {
+            tracing::info!("utun : {packets} paquets lus au total");
+            beat = Instant::now();
+        }
+    }
+}
+
+/// A second descriptor onto the same utun, for the reader thread.
+#[allow(unsafe_code)]
+fn dup_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
+    // SAFETY: `dup` takes a live fd and returns a new one (or -1).
+    let d = unsafe { libc::dup(fd.as_raw_fd()) };
+    if d < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `d` is a live descriptor nobody else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(d) })
 }
 
 /// A utun control socket on a free unit, 10 and up.

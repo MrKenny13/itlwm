@@ -8,7 +8,9 @@ license = "MIT"
 repository = "https://github.com/t4t5/owly"
 
 # Vendored from t4t5/owly (MIT) for owlyd-mac, the macOS port of the
-# engine onto the itlawdl kext. Unmodified sources; see LICENSE.
+# engine onto the itlawdl kext. The sources are the upstream ones, with
+# the port's two documented deviations in src/driver.rs (a bounded
+# stop, and the engine loop's progress counter); see LICENSE.
 
 [features]
 # The driver: a Node on a thread of its own, between a radio and the host's

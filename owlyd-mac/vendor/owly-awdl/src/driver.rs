@@ -16,6 +16,8 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::string::{String, ToString};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::vec::Vec;
 
@@ -93,6 +95,11 @@ pub struct Running {
     stop: watch::Sender<bool>,
     failed: watch::Receiver<Option<String>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The engine loop's iterations since it started, for the host to
+    /// watch its liveness: an iteration count that stands still means a
+    /// blocked loop, one that runs away means a spin. (The macOS port's
+    /// second deviation from the vendored sources.)
+    pub progress: Arc<AtomicU64>,
 }
 
 /// Starts a node with `cfg` on a thread of its own, between the [`Air`] and
@@ -112,6 +119,8 @@ where
     let (stop, stopped) = watch::channel(false);
     let (failed_tx, failed) = watch::channel(None);
     let (opened_tx, opened) = std::sync::mpsc::sync_channel(1);
+    let progress = Arc::new(AtomicU64::new(0));
+    let thread_progress = Arc::clone(&progress);
     let thread = std::thread::Builder::new()
         .name("owly-awdl".into())
         .spawn(move || {
@@ -150,6 +159,7 @@ where
                 tx: TxStats::default(),
                 timer: Time(1),
                 lateness: Lateness::default(),
+                progress: thread_progress.clone(),
             }));
             if let Err(why) = result {
                 tracing::warn!("AWDL stopped: {why}");
@@ -160,6 +170,7 @@ where
         stop,
         failed,
         thread: Some(thread),
+        progress,
     };
     match opened.recv() {
         Ok(Ok(())) => Ok(running),
@@ -226,6 +237,8 @@ struct Driver<A, N> {
     netif: N,
     peers: watch::Sender<Vec<PeerInfo>>,
     stopped: watch::Receiver<bool>,
+    /// The engine loop's heartbeat, published to [`Running::progress`].
+    progress: Arc<AtomicU64>,
     /// Data frames the radio had no room for, with when the node sent them.
     unicast: VecDeque<(Time, Frame)>,
     multicast: VecDeque<(Time, Frame)>,
@@ -426,6 +439,7 @@ async fn run<A: Air, N: Netif>(mut d: Driver<A, N>) -> Result<(), String> {
     let now = d.now();
     d.handle(Input::Timer(now));
     loop {
+        d.progress.fetch_add(1, Ordering::Relaxed);
         let wake = match d.retry_at() {
             Some(retry) => d.instant(d.timer).min(retry),
             None => d.instant(d.timer),

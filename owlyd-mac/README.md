@@ -22,11 +22,28 @@ branch awdl-v2) loaded, and nothing else holding the radio.
 
 ## Layout
 
-    vendor/owly-awdl   owly's sans-IO AWDL crate (MIT); one documented
-                       deviation: Running::stop waits at most 2 s
+    vendor/owly-awdl   owly's sans-IO AWDL crate (MIT); two documented
+                       deviations in its driver: Running::stop waits at
+                       most 2 s, and the engine loop publishes its
+                       iteration count (a liveness heartbeat)
     owlyd-mac          the daemon: sysctl bindings, the Air (a reader
-                       thread over the kext's RX ring + inline inject),
-                       the utun Netif
+                       thread over the kext's RX ring + a writer thread
+                       for the injects), the utun Netif (a reader thread
+                       of its own — AsyncFd's kqueue readiness on the
+                       kernel-control socket starved the whole engine in
+                       the v03 field run)
+
+## Field notes
+
+The v03 run froze the engine after its first MIF: no STATS line ever,
+not one peer from a ring the reader kept feeding. Two causes, both
+fixed in v0.1.3: the utun's AsyncFd reads (a cached-readiness spin
+inside the driver's biased select) and a zombie session from a
+brutally killed run (the OFF→CELL sysctl pair collapsed, and the new
+session inherited the dead one's ring). The engine's own loop was
+replayed for 80 s on Linux with backlog, garbage frames, slow writes
+and kernel DAD traffic — it never froze; the freeze was the I/O
+threads' to cause, and they no longer can.
 
 ## Credits
 

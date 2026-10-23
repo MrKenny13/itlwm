@@ -25,7 +25,9 @@ mod sysctl;
 
 use std::io;
 use std::process::Command;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use air::KextAir;
 use netif::UtunSetup;
@@ -111,8 +113,9 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
     println!("== moteur AWDL lancé (canal {CHANNEL}, présence fixe). Ctrl-C pour arrêter.\n");
 
     let failed = running.failed();
+    let engine = running.progress.clone();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(monitor(peers_rx, failed));
+    rt.block_on(monitor(peers_rx, failed, engine));
     println!("\n== arrêt…");
     running.stop();
     // Give the kext's reader thread a beat to see the channel close and
@@ -125,14 +128,19 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
     Ok(())
 }
 
-/// The watcher loop: peers, failures, counters, Ctrl-C.
+/// The watcher loop: peers, failures, counters, Ctrl-C. The engine's
+/// iteration count rides along every 10 s: a count that stands still
+/// is a blocked engine, one that runs away is a spin — the v03 field
+/// run showed neither, because nothing told us which it was.
 async fn monitor(
     mut peers: watch::Receiver<Vec<PeerInfo>>,
     mut failed: watch::Receiver<Option<String>>,
+    engine: Arc<AtomicU64>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(10));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_peers: Vec<PeerInfo> = Vec::new();
+    let mut last_iters: u64 = 0;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return,
@@ -169,6 +177,9 @@ async fn monitor(
                     let one = stats.lines().map(|l| l.trim()).collect::<Vec<_>>().join(" | ");
                     println!("— {one}");
                 }
+                let iters = engine.load(Ordering::Relaxed);
+                println!("— moteur : {} itérations en 10 s", iters - last_iters);
+                last_iters = iters;
             }
         }
     }
@@ -176,7 +187,47 @@ async fn monitor(
 
 /// Brings the cell up, with the kext's own words for a refusal.
 fn session_up() -> io::Result<()> {
-    sysctl::set_int("debug.itlawdl", state::OFF).ok(); // any stale session first
+    // A session left up by a run that died badly (a killed terminal, a
+    // SIGKILL) must come down -- and be SEEN down -- before a new one
+    // goes up. The kext applies the writes asynchronously (a
+    // thread_call reads `want` when it fires), so an OFF immediately
+    // followed by a CELL can collapse into one CELL against a session
+    // that is already up, which returns early and keeps the previous
+    // ring and counters: the v03 field run began against a session
+    // like that, and its reader drained a dead session's ring.
+    if let Ok(st) = sysctl::get_int("debug.itlawdl") {
+        if st != state::OFF {
+            println!("== une session AWDL traîne d'un run précédent (état {st}) — je la démonte…");
+            sysctl::set_int("debug.itlawdl", state::OFF)?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match sysctl::get_int("debug.itlawdl") {
+                    Ok(v) if v == state::OFF => break,
+                    Ok(v) if v < 0 => {
+                        return Err(io::Error::other(format!(
+                            "la session zombie a refusé de descendre : {}",
+                            state::explain(v)
+                        )));
+                    }
+                    _ if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(100))
+                    }
+                    _ => {
+                        // One more word, then give up loudly: a zombie we
+                        // cannot kill leaves the radio unusable for us.
+                        sysctl::set_int("debug.itlawdl", state::OFF).ok();
+                        std::thread::sleep(Duration::from_millis(500));
+                        if !matches!(sysctl::get_int("debug.itlawdl"), Ok(v) if v == state::OFF) {
+                            return Err(io::Error::other(
+                                "la session zombie ne descend pas — relance, et si ça persiste, redémarre",
+                            ));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
     sysctl::set_int("debug.itlawdl", state::CELL)?;
     for _ in 0..100 {
         match sysctl::get_int("debug.itlawdl") {
