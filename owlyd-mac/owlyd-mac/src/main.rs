@@ -1,16 +1,14 @@
-//! owlyd-mac, phase 1: the AWDL engine — owly-awdl's node — on the
-//! itlawdl kext's cell.
+//! owlyd-mac: the AWDL engine — owly-awdl's node — on the itlawdl kext's
+//! cell, with the AirDrop receiver on top.
 //!
-//! It brings the PIBSS cell up (the kext of this repository, v2.2),
+//! It brings the PIBSS cell up (the kext of this repository, v2.4),
 //! runs the node between the kext's sysctls (the air) and a utun
 //! interface (the host's IPv6), and prints what happens: peers that
-//! turn valid, the kext's counters every 10 s. Ctrl-C stops it and
-//! puts everything back (session down, Wi-Fi back).
-//!
-//! The AirDrop records — mDNS, the picker, the receive flow — are
-//! phase 2; this one proves the engine runs on the radio layer the
-//! kext provides: sync with the iPhone, its mDNS packets arriving on
-//! the utun, ours leaving.
+//! turn valid, the kext's counters every 10 s. Since v0.1.5 the
+//! AirDrop end rides along (the `airdrop` module): `_airdrop._tcp`
+//! announced over mDNS in bursts, the TLS receiver on 8770 an iPhone
+//! requires before it lists anyone, the prompts when one sends.
+//! Ctrl-C stops it and puts everything back.
 //!
 //! The AWDL address is the station's own (en0's): the kext's cell
 //! context carries that address as its node address, and it is the one
@@ -19,6 +17,7 @@
 //! station's. The two setups meet the same requirement from opposite
 //! sides.
 
+mod airdrop;
 mod air;
 mod netif;
 mod sysctl;
@@ -31,10 +30,13 @@ use std::time::{Duration, Instant};
 
 use air::KextAir;
 use netif::UtunSetup;
+use owly_airdrop::driver::receiver::ReceiverEvent;
+use owly_airdrop::proto::messages::Offer;
 use owly_awdl::{Channel, Config, MacAddr, PeerInfo, Presence, RadioConstraints};
 use sysctl::state;
 
-use tokio::sync::watch;
+use tokio::io::AsyncBufReadExt;
+use tokio::sync::{mpsc, watch};
 
 /// The channel the kext's cell sits on (owly's Intel channel, and the
 /// AWDL social channel an iPhone always visits).
@@ -57,6 +59,7 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
+    println!("== owlyd-mac v{}", env!("CARGO_PKG_VERSION"));
     if !euid_is_root() {
         return Err(io::Error::other("lance-le avec sudo (les sysctl du kext l'exigent)"));
     }
@@ -108,6 +111,11 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
     };
 
     let (peers_tx, peers_rx) = watch::channel(Vec::<PeerInfo>::new());
+    // The AirDrop end binds on the utun's index and the session's
+    // link-local, and the engine's open() takes the utun with it — both
+    // are said here, before the move.
+    let link_local = addr.link_local();
+    let scope = utun.index;
     let running = owly_awdl::driver::spawn(cfg, move || Ok((KextAir::new()?, utun.register()?)), peers_tx)
         .map_err(|e| io::Error::other(format!("le moteur AWDL n'a pas démarré : {e}")))?;
     println!("== moteur AWDL lancé (canal {CHANNEL}, présence fixe). Ctrl-C pour arrêter.\n");
@@ -115,7 +123,19 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
     let failed = running.failed();
     let engine = running.progress.clone();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(monitor(peers_rx, failed, engine));
+    rt.block_on(async {
+        // Phase 2: the receiver and its announcements. A failure here (the
+        // port taken, /var/db unwritable) must not take the engine down
+        // with it — the session stays a diagnostic one.
+        let airdrop = match airdrop::start(scope, link_local, name).await {
+            Ok(a) => Some(a),
+            Err(e) => {
+                println!("== AirDrop n'a pas pu démarrer : {e} — le moteur continue sans lui");
+                None
+            }
+        };
+        monitor(peers_rx, failed, engine, airdrop.map(|a| a.events)).await
+    });
     println!("\n== arrêt…");
     running.stop();
     // Give the kext's reader thread a beat to see the channel close and
@@ -128,17 +148,25 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
     Ok(())
 }
 
-/// The watcher loop: peers, failures, counters, Ctrl-C. The engine's
-/// iteration count rides along every 10 s: a count that stands still
-/// is a blocked engine, one that runs away is a spin — the v03 field
-/// run showed neither, because nothing told us which it was.
+/// The watcher loop: peers, failures, counters, the AirDrop receiver's
+/// events, Ctrl-C. The engine's iteration count rides along every 10 s: a
+/// count that stands still is a blocked engine, one that runs away is a
+/// spin — the v03 field run showed neither, because nothing told us which
+/// it was.
 async fn monitor(
     mut peers: watch::Receiver<Vec<PeerInfo>>,
     mut failed: watch::Receiver<Option<String>>,
     engine: Arc<AtomicU64>,
+    airdrop: Option<mpsc::Receiver<ReceiverEvent>>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(10));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    // The receiver's end, when it started; once its channel closes the
+    // branch is disabled by the flag (a closed channel resolves at once,
+    // which would busy-loop the monitor).
+    let mut events = airdrop;
+    let mut airdrop_alive = events.is_some();
     let mut last_peers: Vec<PeerInfo> = Vec::new();
     let mut last_iters: u64 = 0;
     let mut inject: Option<(u64, u64)> = None;
@@ -195,6 +223,88 @@ async fn monitor(
                 println!("— moteur : {} itérations en 10 s", iters - last_iters);
                 last_iters = iters;
             }
+            event = async {
+                match events.as_mut() {
+                    Some(events) => events.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if airdrop_alive => {
+                let Some(event) = event else {
+                    airdrop_alive = false; // the receiver is gone
+                    continue;
+                };
+                match event {
+                    ReceiverEvent::Discovered { peer, .. } => {
+                        println!(
+                            "— AirDrop : vu par [{}] — le /Discover a passé, le nom devrait s'afficher",
+                            peer.ip()
+                        );
+                    }
+                    ReceiverEvent::Request(request) => {
+                        let ask = &request.ask;
+                        println!(
+                            "— AirDrop : {:?} ({:?}) veut envoyer :",
+                            ask.sender_computer_name, ask.sender_model_name
+                        );
+                        match &ask.offer {
+                            Offer::Files(files) => {
+                                for f in files {
+                                    println!(
+                                        "   {:?} {} {}",
+                                        f.name,
+                                        f.file_type,
+                                        f.size.map(|s| format!("{s} o")).unwrap_or_default()
+                                    );
+                                }
+                            }
+                            Offer::Urls(urls) => {
+                                for u in urls {
+                                    println!("   {u:?}");
+                                }
+                            }
+                        }
+                        print!("— accepter ? [o/N] ");
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        // Ctrl-C while the prompt is up must still stop the
+                        // daemon, not just decline the transfer.
+                        let yes = tokio::select! {
+                            line = stdin.next_line() => {
+                                matches!(line, Ok(Some(l))
+                                    if l.trim().eq_ignore_ascii_case("o")
+                                        || l.trim().eq_ignore_ascii_case("oui"))
+                            }
+                            _ = tokio::signal::ctrl_c() => false,
+                        };
+                        if yes {
+                            request.accept();
+                            println!("— accepté, réception en cours…");
+                        } else {
+                            request.decline();
+                            println!("— refusé");
+                        }
+                    }
+                    ReceiverEvent::Withdrawn { .. } => {
+                        println!("— AirDrop : l'envoi a été annulé de l'autre côté");
+                    }
+                    ReceiverEvent::Urls { urls, .. } => {
+                        println!("— AirDrop : lien reçu :");
+                        for u in &urls {
+                            println!("   {u:?}");
+                        }
+                    }
+                    ReceiverEvent::Received { paths, .. } => {
+                        println!("— AirDrop : {} fichier(s) reçu(s) :", paths.len());
+                        for p in &paths {
+                            println!("   {}", p.display());
+                        }
+                        // They landed as root's; sudo says whose they are.
+                        airdrop::give_back_to_user(&paths);
+                    }
+                    ReceiverEvent::Failed { reason, .. } => {
+                        println!("— AirDrop : échec du transfert : {reason}");
+                    }
+                }
+            }
         }
     }
 }
@@ -212,29 +322,51 @@ fn bring_cell_up(wifi: &mut Wifi) -> io::Result<()> {
     let mut attempt = 0;
     loop {
         session_up()?;
-        println!("== j'écoute la radio 12 s — elle doit capter quelque chose (balises, l'iPhone)…");
-        std::thread::sleep(Duration::from_secs(12));
-        match radio_rx() {
-            Some(n) if n > 0 => {
-                println!("== la radio reçoit : {n} trames. En avant.");
-                return Ok(());
-            }
-            seen => {
-                attempt += 1;
-                if attempt >= 3 {
-                    return Err(io::Error::other(format!(
-                        "la radio reste muette ({}) après 3 essais. Envoie le journal du kext : \
-                         sudo log show --last 15m --predicate 'eventMessage contains \"itlawdl\"'",
-                        seen.map(|n| format!("rx={n}")).unwrap_or_else(|| "stats illisibles".into())
-                    )));
-                }
-                println!(
-                    "== la radio ne capte rien (essai {attempt}/2) — je la recycle : session basse, Wi-Fi on → off, session haute…"
-                );
-                session_down_checked();
-                wifi.cycle();
-            }
+        println!("== j'écoute la radio 12 s — elle doit capter quelque chose (compteur toutes les 2 s)…");
+        // v0.1.5: the v05 field run passed the "51 frames" check and then
+        // received nothing for 100 s, and the total alone cannot say when
+        // the radio died: before the engine started (a cell the firmware
+        // brought up half-way, the kext's to fix) or exactly as the first
+        // frames went out (our own TX choking its receive). The counter,
+        // every 2 s, can.
+        let mut samples = [0u64; 6];
+        for slot in &mut samples {
+            std::thread::sleep(Duration::from_secs(2));
+            *slot = radio_rx().unwrap_or(0);
         }
+        let report = samples
+            .iter()
+            .enumerate()
+            .map(|(i, n)| format!("+{}s={}", (i + 1) * 2, n))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("   rx : {report}");
+        let total = samples[samples.len() - 1];
+        if total > 0 {
+            // The last three samples identical means nothing arrived in
+            // the final 4 s of listening: the cell heard once and then
+            // died. Say it and carry on — the engine's own stats are the
+            // second half of the diagnosis.
+            if samples[samples.len() - 3..].iter().all(|n| *n == total) {
+                println!(
+                    "== la réception s'est figée pendant l'écoute (rx bloqué à {total}) — cellule à moitié morte ; le moteur démarre quand même, surveille rx"
+                );
+            }
+            println!("== la radio reçoit : {total} trames. En avant.");
+            return Ok(());
+        }
+        attempt += 1;
+        if attempt >= 3 {
+            return Err(io::Error::other(
+                "la radio reste muette (rx=0) après 3 essais. Envoie le journal du kext : \
+                 sudo log show --last 15m --predicate 'eventMessage contains \"itlawdl\"'",
+            ));
+        }
+        println!(
+            "== la radio ne capte rien (essai {attempt}/2) — je la recycle : session basse, Wi-Fi on → off, session haute…"
+        );
+        session_down_checked();
+        wifi.cycle();
     }
 }
 

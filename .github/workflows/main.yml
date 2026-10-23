@@ -87,6 +87,7 @@ jobs:
           set -euo pipefail
           cargo build --release --manifest-path owlyd-mac/Cargo.toml
           cargo test --release --manifest-path owlyd-mac/Cargo.toml -p owly-awdl --features driver
+          cargo test --release --manifest-path owlyd-mac/Cargo.toml -p owly-airdrop --features tokio --test vectors
           cargo test --release --manifest-path owlyd-mac/Cargo.toml -p owlyd-mac
       - name: Package
         run: |

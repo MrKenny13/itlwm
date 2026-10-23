@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["vendor/owly-awdl", "owlyd-mac"]
+members = ["vendor/owly-awdl", "vendor/owly-airdrop", "owlyd-mac"]
+
+[workspace.lints.rust]
+# Code that needs unsafe allows it locally, with a SAFETY comment.
+unsafe_code = "deny"
 
 [profile.release]
 lto = "thin"
