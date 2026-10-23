@@ -258,7 +258,7 @@ awdl_probe_detach(ItlIwx *iwx)
         gAwdlSysctlRegistered = false;
     }
     if (gAwdl.call) {
-        thread_call_cancel_wait(gAwdl.call);
+        thread_call_cancel(gAwdl.call);   /* _wait is private KPI: unresolved for a third-party kext */
         thread_call_free(gAwdl.call);
         gAwdl.call = NULL;
     }
