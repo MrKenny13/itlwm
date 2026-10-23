@@ -8762,9 +8762,9 @@ iwx_mac_ctxt_cmd_common(struct iwx_softc *sc, struct iwx_node *in,
             cmd->ibss.bi = htole32(10000);
             cmd->ibss.bi_reciprocal = htole32(iwx_reciprocal(10000));
             cmd->ibss.beacon_template = htole32(0);
-        } else {
-            cmd->pibss.is_disc_extended = htole32(0);
         }
+        /* PIBSS: nothing to set -- the pibss arm stays zeroed (the
+         * struct this firmware defines has only stats_interval). */
         cmd->filter_flags = htole32(IWX_MAC_FILTER_ACCEPT_GRP);
         return;
     }
