@@ -70,12 +70,25 @@ fn run() -> io::Result<()> {
     println!("== station {STATION}, adresse AWDL {addr}, nom « {name} »");
 
     // The session needs the interface down; take it down ourselves and
-    // put it back after, as the test scripts do.
+    // put it back after — on the way out AND on any failure, so a
+    // startup error never leaves the Mac without its Wi-Fi.
     let mut wifi = Wifi::new(STATION);
     wifi.off()?;
 
+    if let Err(e) = session(addr, &name, &mut wifi) {
+        session_down();
+        wifi.on();
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Everything that runs between the interface going down and coming
+/// back: the cell, the utun, the engine, the monitor. The caller puts
+/// the interface back if any of it fails.
+fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
     session_up()?;
-    let utun = UtunSetup::open(addr).inspect_err(|_| session_down())?;
+    let utun = UtunSetup::open(addr)?;
     println!("== utun {} (index {})", utun.name, utun.index);
 
     let cfg = {
@@ -94,10 +107,7 @@ fn run() -> io::Result<()> {
 
     let (peers_tx, peers_rx) = watch::channel(Vec::<PeerInfo>::new());
     let running = owly_awdl::driver::spawn(cfg, move || Ok((KextAir::new(), utun.register()?)), peers_tx)
-        .map_err(|e| {
-            session_down();
-            io::Error::other(format!("le moteur AWDL n'a pas démarré : {e}"))
-        })?;
+        .map_err(|e| io::Error::other(format!("le moteur AWDL n'a pas démarré : {e}")))?;
     println!("== moteur AWDL lancé (canal {CHANNEL}, présence fixe). Ctrl-C pour arrêter.\n");
 
     let failed = running.failed();

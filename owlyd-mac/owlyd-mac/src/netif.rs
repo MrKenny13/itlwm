@@ -26,6 +26,11 @@ const SYSPROTO_CONTROL: libc::c_int = 2;
 const AF_SYS_CONTROL: libc::c_ushort = 2;
 /// `_IOWR('N', 3, struct ctl_info)`: 96 bytes of name, 4 of ID.
 const CTLIOCGINFO: libc::c_ulong = 0xC064_4E03;
+/// The utun kernel control, as XNU registers it (`bsd/net/if_utun.h`:
+/// `UTUN_CONTROL_NAME`). The trailing `_control` is the name; the bare
+/// "com.apple.net.utun" some pages show makes `CTLIOCGINFO` answer
+/// ENOENT — the first release shipped that and died on real Macs.
+const UTUN_CONTROL: &[u8] = b"com.apple.net.utun_control\0";
 /// Darwin's AF_INET6, the utun prefix says.
 const AF_INET6: u32 = 30;
 /// `awdl0`'s MTU on Linux, and ours.
@@ -212,7 +217,7 @@ fn open_control() -> io::Result<(OwnedFd, libc::c_uint)> {
         ctl_id: 0,
         ctl_name: [0; 96],
     };
-    info.ctl_name[..b"com.apple.net.utun\0".len()].copy_from_slice(b"com.apple.net.utun\0");
+    info.ctl_name[..UTUN_CONTROL.len()].copy_from_slice(UTUN_CONTROL);
     #[allow(unsafe_code)]
     // SAFETY: `info` is a valid ctl_info of the size the ioctl takes.
     if unsafe {
@@ -223,7 +228,11 @@ fn open_control() -> io::Result<(OwnedFd, libc::c_uint)> {
         )
     } < 0
     {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        return Err(io::Error::other(format!(
+            "le control utun du noyau est introuvable ({}) : {e}",
+            String::from_utf8_lossy(&UTUN_CONTROL[..UTUN_CONTROL.len() - 1])
+        )));
     }
 
     for unit in 10u32..40 {
@@ -253,6 +262,42 @@ fn open_control() -> io::Result<(OwnedFd, libc::c_uint)> {
         }
     }
     Err(io::Error::other("aucune unité utun libre"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `CTLIOCGINFO` turns the control's name into its kernel ID; a
+    /// name that isn't registered answers ENOENT. That is exactly how
+    /// v0.1 died in the field (the bare `com.apple.net.utun`), so the
+    /// name is now proven at test time, where the CI's macOS runner
+    /// exercises it for real. Resolving needs no privileges — only
+    /// connecting does.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn utun_control_name_resolves() {
+        #[allow(unsafe_code)]
+        // SAFETY: an fd that opened is closed before the assert can end us.
+        unsafe {
+            let fd = libc::socket(AF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL);
+            assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+            let mut info = CtlInfo {
+                ctl_id: 0,
+                ctl_name: [0; 96],
+            };
+            info.ctl_name[..UTUN_CONTROL.len()].copy_from_slice(UTUN_CONTROL);
+            let r = libc::ioctl(
+                fd,
+                CTLIOCGINFO as libc::c_ulong,
+                (&mut info as *mut CtlInfo).cast::<libc::c_void>(),
+            );
+            let said = io::Error::last_os_error();
+            libc::close(fd);
+            assert_eq!(r, 0, "CTLIOCGINFO a dit : {said}");
+            assert_ne!(info.ctl_id, 0, "CTLIOCGINFO n'a pas donné d'ID");
+        }
+    }
 }
 
 #[allow(unsafe_code)]
