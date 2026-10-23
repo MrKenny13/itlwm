@@ -35,6 +35,21 @@
 //  seen), inject counters reset with the session now, and injected
 //  frames owe the node reference their completion releases.
 //
+//  v2.7: the poison was the rate byte, not the queue. The v08 field
+//  run (v2.6, binding 1) repeated v2.5's exact signature -- ok=10,
+//  done=0, rx dead at the first TFD, and now fw_err=2 to name it: a
+//  firmware error dump. The inject path's legacy branch never set
+//  hwrate on this VER_8 TX command (the >8 version branch is for
+//  other firmwares), so rate_n_flags carried an uninitialized stack
+//  byte -- every action frame ever injected, on every binding. The
+//  fix is the line iwx_tx_fill_cmd had all along: hwrate =
+//  rinfo->plcp. The stats grow txrate= (the exact rate_n_flags the
+//  firmware received -- the proof the byte is the PLCP code, e.g.
+//  0x...05 for 12 Mbit/s) and fwid=/il1=/hcmd= (the last error
+//  dump's assert id, interrupt link, and command word), so if
+//  anything still wedges, the next log names the assert without the
+//  system log.
+//
 //  With Wi-Fi turned OFF in macOS, `sysctl -w debug.itlawdl=2` restarts
 //  the firmware as a "cell" on channel 6: a PIBSS MAC context (Intel's
 //  pseudo-IBSS; a plain IBSS one receives nothing on this firmware) on
@@ -120,7 +135,14 @@ struct awdl_session_state {
     uint64_t inject_done, inject_recycled;
     uint64_t inject_done_err;
     uint32_t inject_last_status;
+    /* v2.7: the last rate_n_flags handed to the firmware (txrate=) --
+     * proof in every log that the rate byte is the PLCP code, not
+     * stack garbage like every injected frame before v2.7. */
+    uint32_t inject_rate_nf;
     uint64_t fw_err;
+    /* v2.7: the last error dump's identity -- which assert (fwid=),
+     * where (il1=), executing which command word (hcmd=). */
+    uint32_t fw_err_id, fw_err_il1, fw_err_hcmd;
 
     /* v2.6: the binding this session's inject queue came up on
      * (tx_sta = debug.itlawdl_txsta's value at session start;
@@ -271,8 +293,8 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         "rx=%llu bytes=%llu dropped=%llu dup=%llu\n"
         "awdl action=%llu psf=%llu mif=%llu other=%llu data=%llu data_bytes=%llu\n"
         "peer %02x:%02x:%02x:%02x:%02x:%02x rssi=%d\n"
-        "inject ok=%llu err=%llu bytes=%llu done=%llu recycled=%llu done_err=%llu last=0x%x\n"
-        "fw_err=%llu txsta=%d(sta %d tid %d want %d)\n"
+        "inject ok=%llu err=%llu bytes=%llu done=%llu recycled=%llu done_err=%llu last=0x%x txrate=0x%x\n"
+        "fw_err=%llu fwid=0x%x il1=0x%x hcmd=0x%x txsta=%d(sta %d tid %d want %d)\n"
         "state=%d cell=%d(want %d) channel=%d\n",
         gAwdl.rx, gAwdl.rx_bytes, gAwdl.rx_dropped, gAwdl.dup,
         gAwdl.action, gAwdl.psf, gAwdl.mif, gAwdl.other_action,
@@ -283,7 +305,10 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         gAwdl.inject_ok, gAwdl.inject_err, gAwdl.inject_bytes,
         gAwdl.inject_done, gAwdl.inject_recycled,
         gAwdl.inject_done_err, (unsigned)gAwdl.inject_last_status,
-        gAwdl.fw_err, gAwdl.tx_sta, gAwdl.tx_sta_id, gAwdl.tx_tid,
+        (unsigned)gAwdl.inject_rate_nf,
+        gAwdl.fw_err, (unsigned)gAwdl.fw_err_id,
+        (unsigned)gAwdl.fw_err_il1, (unsigned)gAwdl.fw_err_hcmd,
+        gAwdl.tx_sta, gAwdl.tx_sta_id, gAwdl.tx_tid,
         gAwdl.tx_sta_wanted,
         gAwdl.session, gAwdl.cell, gAwdl.cell_wanted, gAwdl.channel);
     if (n < 0)

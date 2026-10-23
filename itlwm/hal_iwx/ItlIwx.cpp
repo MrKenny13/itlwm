@@ -11488,7 +11488,16 @@ iwx_nic_error(struct iwx_softc *sc)
         XYLog("%s: errlog not found, skipping\n", DEVNAME(sc));
         return;
     }
-    
+
+    /* itlawdl v2.7: keep the dump's identity too -- fw_err's count is
+     * already in the stats; the error id (which assert) and the
+     * interrupt link (where) now ride along, so a field log says what
+     * the firmware choked on without hunting the system log. hcmd is
+     * the command word it was executing. */
+    gAwdl.fw_err_id = table.error_id;
+    gAwdl.fw_err_il1 = table.ilink1;
+    gAwdl.fw_err_hcmd = table.hcmd;
+
     if (ERROR_START_OFFSET <= table.valid * ERROR_ELEM_SIZE) {
         XYLog("%s: Start Error Log Dump:\n", DEVNAME(sc));
         XYLog("%s: Status: 0x%x, count: %d\n", DEVNAME(sc),
@@ -14529,7 +14538,7 @@ awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
     {
         int min_ridx = iwx_rval2ridx(ieee80211_min_basic_rate(ic));
         int ridx;
-        uint8_t hwrate;
+        uint8_t hwrate = 0;    /* v2.7: never stack garbage again */
         uint32_t rate_flags;
         uint8_t cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_TX_CMD);
 
@@ -14546,6 +14555,17 @@ awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
                 ridx = min_ridx;
             rinfo = &iwx_rates[ridx];
             rate_flags = iwx_get_tx_ant(sc, &in->in_ni, rinfo, type, wh);
+            /* v2.7: hwrate is the PLCP code here (0x5 is 12 Mbit/s) --
+             * the one line this copy of iwx_tx skipped. On this firmware
+             * the TX command is VER_8, so the >8 branch below never runs
+             * and hwrate stayed an UNINITIALIZED stack byte: every legacy
+             * frame ever injected (every action frame -- the daemon's
+             * Legacy(24)) left with rate_n_flags = ant | garbage. The v08
+             * field run paid for it: done=0 (the firmware never
+             * transmitted one), fw_err=2 (its error dump), and rx dead
+             * from the very first TFD -- a TX command whose rate the PHY
+             * cannot honour takes the whole MAC down with it. */
+            hwrate = rinfo->plcp;
             if (cmdver > 8 && cmdver != IWX_FW_CMD_VER_UNKNOWN) {
                 if (IWX_RIDX_IS_CCK(ridx)) {
                     rate_flags |= IWX_RATE_MCS_CCK_MSK;
@@ -14572,6 +14592,10 @@ awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
              * frame rejected on sight at best (v2.5 removed it — every
              * unicast this daemon ever sent carried it). */
         }
+        /* v2.7: the word the firmware actually receives, kept for the
+         * stats (txrate=) -- the v08 run's rate byte was stack garbage,
+         * and the next log has to prove the fix took. */
+        gAwdl.inject_rate_nf = rate_flags | hwrate;
         rate_n_flags = htole32(rate_flags | hwrate);
     }
 
