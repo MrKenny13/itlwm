@@ -219,3 +219,46 @@ template, et l'ordre exact. C'est un vrai portage de sous-système, à
 faire posément (idéalement avec la source iwlmld + les octets déjà
 capturés dans hcmd-bytes). Tous les octets des commandes individuelles
 sont connus (capture 2026-10-24) ; ce qui reste, c'est l'orchestration.
+
+---
+
+## v2.8.7 / v2.8.8 — rejeu du bring-up : accepté, contexte toujours pas vivant
+
+v2.8.7 rejoue la fenêtre d'injection complète d'owly (#82-98 : MAC,
+LINK ADD phy-unbound, PHY, RLC, LINK MODIFY, BEACON, STA mcast+queue,
+STA bcast_mgmt+queue, LINK MODIFY), MAC patchée. v2.8.8 corrige un
+BAD_COMMAND (le firmware exige un contexte PHY avant MAC_CONFIG ; on
+remet le phy d'itlwm et on retire les PHY d'owly).
+
+Résultat v2.8.8 :
+- MAC_CONFIG de nouveau accepté, le setup va au bout sans planter.
+- **rx=0** toujours — le contexte ne délivre pas de RX à l'hôte.
+- **émission** : la file rendue = qid 2 (owly obtenait 28), la trame
+  reste coincée (tx ring 2 cur=1 queued=1), jamais servie, puis assert
+  générique 0x20101034.
+
+### Ce qui reste
+
+Rejouer la seule fenêtre #82-98 ne suffit pas. owly fait ~100 commandes
+au total ; beaucoup (système 2.0f, phy-db 1.a9/1.d2, data-path 5.16/
+5.02, aux/scan) sont faites par iwlwifi au boot et configurent l'état
+du firmware (tables de files, data-path) dans lequel le contexte
+d'injection devient réellement servi. itlwm fait SON propre boot avec
+les commandes LEGACY, donc l'état firmware n'est pas le même que celui
+qu'owly construit entièrement en nouvelle API.
+
+Deux hypothèses pour la suite :
+1. **RX attendu à 0** : owly reçoit via un contexte monitor SÉPARÉ
+   (mac_type=5), pas via la cellule d'injection (mac_type=4). Donc rx=0
+   sur la cellule seule peut être normal ; le vrai blocage est la TX.
+2. **TX sur qid 2 non servie** : le firmware assigne une file basse
+   (2) parce que l'état n'est pas celui d'owly (qui avait déjà files
+   0-27 prises → 28). Une file basse/réservée n'est pas servie pour du
+   host TX. Il faudrait l'état firmware complet d'owly (tout le boot
+   nouvelle API), pas seulement la fenêtre d'injection.
+
+Conclusion : finir = porter une part bien plus large du bring-up iwlmld
+(le boot nouvelle API, pas juste l'interface), ou piloter la carte
+entièrement en nouvelle API depuis le chargement du firmware. C'est un
+portage conséquent et itératif (chaque essai = un reboot). Tous les
+octets sont dans hcmd-bytes ; ce qui manque est l'orchestration large.
