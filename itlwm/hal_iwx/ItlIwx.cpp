@@ -10020,7 +10020,13 @@ iwx_awdl_mld_inject_setup(struct iwx_softc *sc, struct iwx_node *in)
     err = iwx_send_cmd_pdu(sc,
         iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0),
         0, 52, buf);
-    if (err) { XYLog("itlawdl: MAC_CONFIG failed %d\n", err); return err; }
+    if (err) { XYLog("itlawdl: MAC_CONFIG ADD failed %d\n", err); return err; }
+    /* v2.8.6: owly also MODIFYs the MAC right after ADD. */
+    awdl_le32p(buf + 4, 2);               /* action = MODIFY */
+    err = iwx_send_cmd_pdu(sc,
+        iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0),
+        0, 52, buf);
+    if (err) { XYLog("itlawdl: MAC_CONFIG MODIFY failed %d\n", err); return err; }
 
     /* LINK_CONFIG_CMD (ADD, active). Rates/EDCA/bi/BSSID are owly's. */
     {
@@ -10048,7 +10054,17 @@ iwx_awdl_mld_inject_setup(struct iwx_softc *sc, struct iwx_node *in)
         err = iwx_send_cmd_pdu(sc,
             iwx_cmd_id(IWX_LINK_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0),
             0, 208, buf);
-        if (err) { XYLog("itlawdl: LINK_CONFIG failed %d\n", err); return err; }
+        if (err) { XYLog("itlawdl: LINK_CONFIG ADD failed %d\n", err); return err; }
+        /* v2.8.6: owly activates the link with a separate MODIFY
+         * (action=2, modify_mask=2, active=1) -- a single ADD left the
+         * radio deaf (rx=0) in the v2.8.5 run. */
+        awdl_le32p(buf + 0, 2);           /* action = MODIFY */
+        awdl_le32p(buf + 24, 2);          /* modify_mask = 2 (active) */
+        awdl_le32p(buf + 28, 1);          /* active = 1 */
+        err = iwx_send_cmd_pdu(sc,
+            iwx_cmd_id(IWX_LINK_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0),
+            0, 208, buf);
+        if (err) { XYLog("itlawdl: LINK_CONFIG MODIFY failed %d\n", err); return err; }
     }
 
     /* STA_CONFIG_CMD: the bcast_mgmt injection station, sta_id 2. */

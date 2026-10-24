@@ -106,7 +106,7 @@ fn run() -> io::Result<()> {
     let mut wifi = Wifi::new(STATION);
     wifi.off()?;
 
-    if let Err(e) = session(addr, &name, &mut wifi, opts.no_tx) {
+    if let Err(e) = session(addr, &name, &mut wifi, opts.no_tx, opts.ignore_rx) {
         session_down_checked();
         wifi.on();
         return Err(e);
@@ -117,8 +117,8 @@ fn run() -> io::Result<()> {
 /// Everything that runs between the interface going down and coming
 /// back: the cell, the utun, the engine, the monitor. The caller puts
 /// the interface back if any of it fails.
-fn session(addr: MacAddr, name: &str, wifi: &mut Wifi, no_tx: bool) -> io::Result<()> {
-    bring_cell_up(wifi)?;
+fn session(addr: MacAddr, name: &str, wifi: &mut Wifi, no_tx: bool, ignore_rx: bool) -> io::Result<()> {
+    bring_cell_up(wifi, ignore_rx)?;
     let utun = UtunSetup::open(addr)?;
     println!("== utun {} (index {})", utun.name, utun.index);
 
@@ -373,7 +373,7 @@ async fn monitor(
 /// has worked every time so far is a full power cycle (Wi-Fi on → off)
 /// right before the cell goes up: that is the sequence every session
 /// that ever received was brought up with.
-fn bring_cell_up(wifi: &mut Wifi) -> io::Result<()> {
+fn bring_cell_up(wifi: &mut Wifi, ignore_rx: bool) -> io::Result<()> {
     let mut attempt = 0;
     loop {
         session_up()?;
@@ -408,6 +408,12 @@ fn bring_cell_up(wifi: &mut Wifi) -> io::Result<()> {
                 );
             }
             println!("== la radio reçoit : {total} trames. En avant.");
+            return Ok(());
+        }
+        if ignore_rx {
+            // v0.2.4: --ignorer-rx forces the session on even deaf, to
+            // test TX (done=) when RX is not up yet (new-API MLD setup).
+            println!("== rx=0 mais --ignorer-rx : on continue quand même pour tester l'émission");
             return Ok(());
         }
         attempt += 1;
@@ -506,6 +512,8 @@ fn session_down_checked() {
 struct Opts {
     /// `--sans-emission`: the control run, nothing goes out.
     no_tx: bool,
+    /// `--ignorer-rx`: proceed to inject even if rx stays 0.
+    ignore_rx: bool,
     /// `--liaison N`: debug.itlawdl_txsta for this session.
     txsta: Option<i32>,
     /// `--cellule N`: debug.itlawdl_cell for this session.
@@ -514,7 +522,7 @@ struct Opts {
 
 impl Opts {
     fn parse() -> io::Result<Opts> {
-        let mut o = Opts { no_tx: false, txsta: None, cell: None };
+        let mut o = Opts { no_tx: false, ignore_rx: false, txsta: None, cell: None };
         let mut args = std::env::args().skip(1);
         let num = |flag: &str, v: Option<String>| -> io::Result<i32> {
             v.and_then(|s| s.parse().ok())
@@ -523,6 +531,7 @@ impl Opts {
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--sans-emission" | "--no-tx" => o.no_tx = true,
+                "--ignorer-rx" | "--ignore-rx" => o.ignore_rx = true,
                 "--liaison" | "--txsta" => o.txsta = Some(num(&a, args.next())?),
                 "--cellule" | "--cell" => o.cell = Some(num(&a, args.next())?),
                 "-h" | "--help" | "--aide" => {
