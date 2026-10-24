@@ -176,6 +176,22 @@ impl Gate {
         }
     }
 
+    /// v0.2.2: the control experiment's gate -- shut from the start and
+    /// for good (`--sans-emission`): the engine runs, receives and builds
+    /// its frames, and not one reaches the kext. A firmware that still
+    /// dumps (fw_err climbing) with nothing sent dies of the context,
+    /// not of our TX.
+    pub fn closed() -> Gate {
+        let g = Gate::new();
+        {
+            let mut l = g.ladder.lock().unwrap();
+            l.held = Some((0, "contrôle sans émission".into()));
+            l.reopens = REOPEN_MAX;
+            l.state = "émission coupée (contrôle sans émission, voulu)".into();
+        }
+        g
+    }
+
     /// Whether this frame may go out now. Called from the engine's
     /// thread for every frame it builds — including the ones it eats.
     pub fn admit(&self, now: Instant) -> bool {

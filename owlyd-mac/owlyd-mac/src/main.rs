@@ -63,6 +63,7 @@ fn run() -> io::Result<()> {
     if !euid_is_root() {
         return Err(io::Error::other("lance-le avec sudo (les sysctl du kext l'exigent)"));
     }
+    let opts = Opts::parse()?;
     let stats = sysctl::read_string("debug.itlawdl_stats")
         .map_err(|_| io::Error::other("le kext itlawdl n'est pas chargé (v2.2 ou plus)"))?;
     println!("== kext :\n{stats}");
@@ -77,10 +78,35 @@ fn run() -> io::Result<()> {
     // The session needs the interface down; take it down ourselves and
     // put it back after — on the way out AND on any failure, so a
     // startup error never leaves the Mac without its Wi-Fi.
+    // v0.2.2: the session's shape, said on the command line instead of
+    // a sysctl to remember after every reboot. Both are read by the kext
+    // when the session comes up.
+    if let Some(n) = opts.txsta {
+        sysctl::set_int("debug.itlawdl_txsta", n)
+            .map_err(|e| io::Error::other(format!("--liaison {n} refusée par le kext ({e}) — kext trop ancien ?")))?;
+    }
+    if let Some(n) = opts.cell {
+        sysctl::set_int("debug.itlawdl_cell", n)
+            .map_err(|e| io::Error::other(format!("--cellule {n} refusée par le kext ({e})")))?;
+    }
+    println!(
+        "== liaison {} | cellule {} | {}",
+        sysctl::get_int("debug.itlawdl_txsta").map(|v| v.to_string()).unwrap_or("?".into()),
+        match sysctl::get_int("debug.itlawdl_cell") {
+            Ok(0) => "auto (pibss)".to_string(),
+            Ok(2) => "listener".to_string(),
+            Ok(3) => "pibss".to_string(),
+            Ok(4) => "ibss".to_string(),
+            Ok(v) => v.to_string(),
+            Err(_) => "?".to_string(),
+        },
+        if opts.no_tx { "SANS ÉMISSION (contrôle)" } else { "émission par la rampe" }
+    );
+
     let mut wifi = Wifi::new(STATION);
     wifi.off()?;
 
-    if let Err(e) = session(addr, &name, &mut wifi) {
+    if let Err(e) = session(addr, &name, &mut wifi, opts.no_tx) {
         session_down_checked();
         wifi.on();
         return Err(e);
@@ -91,7 +117,7 @@ fn run() -> io::Result<()> {
 /// Everything that runs between the interface going down and coming
 /// back: the cell, the utun, the engine, the monitor. The caller puts
 /// the interface back if any of it fails.
-fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
+fn session(addr: MacAddr, name: &str, wifi: &mut Wifi, no_tx: bool) -> io::Result<()> {
     bring_cell_up(wifi)?;
     let utun = UtunSetup::open(addr)?;
     println!("== utun {} (index {})", utun.name, utun.index);
@@ -121,7 +147,7 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
     // The ramp the engine's every frame out must pass (v0.1.6: the v06
     // run froze rx at the engine's first frames; a staged climb names
     // the killer — one frame or the pace).
-    let gate = Arc::new(Gate::new());
+    let gate = Arc::new(if no_tx { Gate::closed() } else { Gate::new() });
     let gate_engine = gate.clone();
     let loop_in: Arc<std::sync::Mutex<Option<mpsc::Sender<Ipv6Packet>>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -141,7 +167,11 @@ fn session(addr: MacAddr, name: &str, wifi: &mut Wifi) -> io::Result<()> {
         .unwrap()
         .take()
         .ok_or_else(|| io::Error::other("le moteur n'a pas rendu l'entrée utun"))?;
-    println!("== moteur AWDL lancé (canal {CHANNEL}, présence fixe, rampe 1→4→12 tr/s puis libre). Ctrl-C pour arrêter.\n");
+    if no_tx {
+        println!("== moteur AWDL lancé (canal {CHANNEL}) — CONTRÔLE : aucune trame n'est émise. Laisse tourner 2 min et surveille fw_err= et rx= dans les stats. Ctrl-C pour arrêter.\n");
+    } else {
+        println!("== moteur AWDL lancé (canal {CHANNEL}, présence fixe, rampe 1→4→12 tr/s puis libre). Ctrl-C pour arrêter.\n");
+    }
 
     let failed = running.failed();
     let engine = running.progress.clone();
@@ -469,6 +499,45 @@ fn session_down_checked() {
             return;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The command line (v0.2.2).
+struct Opts {
+    /// `--sans-emission`: the control run, nothing goes out.
+    no_tx: bool,
+    /// `--liaison N`: debug.itlawdl_txsta for this session.
+    txsta: Option<i32>,
+    /// `--cellule N`: debug.itlawdl_cell for this session.
+    cell: Option<i32>,
+}
+
+impl Opts {
+    fn parse() -> io::Result<Opts> {
+        let mut o = Opts { no_tx: false, txsta: None, cell: None };
+        let mut args = std::env::args().skip(1);
+        let num = |flag: &str, v: Option<String>| -> io::Result<i32> {
+            v.and_then(|s| s.parse().ok())
+                .ok_or_else(|| io::Error::other(format!("{flag} attend un nombre")))
+        };
+        while let Some(a) = args.next() {
+            match a.as_str() {
+                "--sans-emission" | "--no-tx" => o.no_tx = true,
+                "--liaison" | "--txsta" => o.txsta = Some(num(&a, args.next())?),
+                "--cellule" | "--cell" => o.cell = Some(num(&a, args.next())?),
+                "-h" | "--help" | "--aide" => {
+                    println!(
+                        "usage : sudo ./owlyd-mac [--sans-emission] [--liaison 0-4] [--cellule 0|2|3|4]\n\
+                         \x20 --sans-emission  contrôle : la session tourne, rien n'est émis\n\
+                         \x20 --liaison N      debug.itlawdl_txsta (4 = snif_sta d'iwlwifi, kext 2.8)\n\
+                         \x20 --cellule N      debug.itlawdl_cell (0 auto/pibss, 2 listener, 3 pibss, 4 ibss)"
+                    );
+                    std::process::exit(0);
+                }
+                other => return Err(io::Error::other(format!("option inconnue : {other} (--aide)"))),
+            }
+        }
+        Ok(o)
     }
 }
 

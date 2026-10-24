@@ -7517,9 +7517,19 @@ iwx_disable_beacon_filter(struct iwx_softc *sc)
  * PIBSS one does not. Binding 3 is binding 1 with only the station's
  * type (and address, the broadcast) changed: same sta 0, same queue
  * 2, same tid 15 -- the single-variable experiment. */
+/* v2.8: binding 4 is iwlwifi mvm's monitor-injection object, the
+ * snif_sta (iwl_mvm_add_snif_sta): a GENERAL_PURPOSE station with a
+ * zero address, bound to the monitor vif's own MAC context, its queue
+ * opened on tid IWL_MAX_TID_COUNT (8) -- the internal-station tid under
+ * TVQM -- and carrying no HT flags. Bindings 1 and 2 put OUR address
+ * on a LINK/AUX station, a shape mvm never builds; 0 was the snif shape
+ * on tid 15. Meant for `debug.itlawdl_cell=2` (a LISTENER context
+ * through the cell path: promisc, no FCS, frames consumed by the ring),
+ * the context mvm injects from. */
 static void
-awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type)
+awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type, int *tid)
 {
+    *tid = IWX_MGMT_TID;
     switch (sel) {
     case 1:
         *sta_id = IWX_STATION_ID;
@@ -7533,6 +7543,12 @@ awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type)
         /* v2.7.2: the mcast shape -- see the block comment above. */
         *sta_id = IWX_STATION_ID;
         *sta_type = IWX_STA_MULTICAST;
+        break;
+    case 4:
+        /* v2.8: mvm's snif_sta -- see the comment above. */
+        *sta_id = IWX_MONITOR_STA_ID;
+        *sta_type = IWX_STA_GENERAL_PURPOSE;
+        *tid = IWX_MAX_TID_COUNT;
         break;
     default:
         *sta_id = IWX_MONITOR_STA_ID;
@@ -7561,8 +7577,9 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
         /* itlawdl v2.6: the inject station is selectable, see
          * awdl_tx_sta_shape. Default 1 repeats the STA-mode shape that
          * carried the boot-time traffic. */
-        int sid, stype;
-        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype);
+        int sid, stype, stid;
+        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype, &stid);
+        (void)stid;
         add_sta_cmd.sta_id = sid;
         add_sta_cmd.station_type = stype;
     } else {
@@ -7573,8 +7590,8 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
     = htole32(IWX_FW_CMD_ID_AND_COLOR(in->in_id, in->in_color));
     if (!update) {
         if (ic->ic_opmode == IEEE80211_M_MONITOR &&
-            sc->sc_awdl_tx_sta == 0)
-            /* v2.5's shape: a zero address */
+            (sc->sc_awdl_tx_sta == 0 || sc->sc_awdl_tx_sta == 4))
+            /* v2.5's shape, and v2.8's snif_sta: a zero address */
             IEEE80211_ADDR_COPY(&add_sta_cmd.addr,
                                 etheranyaddr);
         else if (ic->ic_opmode == IEEE80211_M_MONITOR &&
@@ -7597,9 +7614,12 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
     |= htole32(IWX_STA_FLG_FAT_EN_MSK | IWX_STA_FLG_MIMO_EN_MSK);
     add_sta_cmd.tid_disable_tx = htole16(0xffff);
         
-    if ((in->in_ni.ni_flags & IEEE80211_NODE_HT) ||
+    /* v2.8: binding 4 is an internal station, as bare as mvm's
+     * snif_sta -- no HT/aggregation flags off the cell's HT node. */
+    if (!(ic->ic_opmode == IEEE80211_M_MONITOR && sc->sc_awdl_tx_sta == 4) &&
+        ((in->in_ni.ni_flags & IEEE80211_NODE_HT) ||
         (in->in_ni.ni_flags & IEEE80211_NODE_VHT) ||
-        (in->in_ni.ni_flags & IEEE80211_NODE_HE)) {
+        (in->in_ni.ni_flags & IEEE80211_NODE_HE))) {
         add_sta_cmd.station_flags_msk
         |= htole32(IWX_STA_FLG_MAX_AGG_SIZE_MSK |
                    IWX_STA_FLG_AGG_MPDU_DENS_MSK);
@@ -7733,8 +7753,9 @@ iwx_rm_sta_cmd(struct iwx_softc *sc, struct iwx_node *in)
     if (ic->ic_opmode == IEEE80211_M_MONITOR) {
         /* itlawdl v2.6: remove the station the session actually
          * added (awdl_tx_sta_shape's pick). */
-        int sid, stype;
-        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype);
+        int sid, stype, stid;
+        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype, &stid);
+        (void)stype; (void)stid;
         rm_sta_cmd.sta_id = sid;
     } else
         rm_sta_cmd.sta_id = IWX_STATION_ID;
@@ -9926,10 +9947,11 @@ iwx_auth(struct iwx_softc *sc)
     if (ic->ic_opmode == IEEE80211_M_MONITOR) {
         /* itlawdl v2.6: bind the inject queue to the selected
          * station (awdl_tx_sta_shape). */
-        int sid, stype;
-        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype);
+        int sid, stype, stid;
+        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype, &stid);
+        /* v2.8: the tid is the binding's (8 for the snif_sta). */
         err = iwx_enable_txq(sc, sid,
-                             IWX_DQA_INJECT_MONITOR_QUEUE, IWX_MGMT_TID,
+                             IWX_DQA_INJECT_MONITOR_QUEUE, stid,
                              sc->txq[IWX_DQA_INJECT_MONITOR_QUEUE].ring_count);
         if (err)
             goto rm_sta;
@@ -14284,12 +14306,12 @@ awdlSessionSetGated(int target, int cell_wanted)
     gAwdl.cell_wanted = cell_wanted;
     gAwdl.channel = AWDL_SESSION_CHANNEL;
     {
-        int sid, stype;
-        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype);
+        int sid, stype, stid;
+        awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype, &stid);
         gAwdl.tx_sta = sc->sc_awdl_tx_sta;
         gAwdl.tx_sta_id = sid;
         gAwdl.tx_sta_type = stype;
-        gAwdl.tx_tid = IWX_MGMT_TID;
+        gAwdl.tx_tid = stid;
     }
     XYLog("itlawdl: %s session up (channel %d, fw mac type %d, inject sta %d)\n",
           target == 2 ? "cell" : "listen", AWDL_SESSION_CHANNEL, cell,

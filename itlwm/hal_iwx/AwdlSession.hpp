@@ -73,6 +73,17 @@
 //  UMAC's own numbers without hunting kprintf output the field never
 //  reads.
 //
+//  v2.8: the dossier review. Bindings 1 and 2 -- the two that killed
+//  the UMAC -- both put OUR OWN address on a LINK/AUX station, a shape
+//  iwlwifi mvm never builds (its STA-mode LINK station carries the
+//  AP's address; its aux station sits on no real MAC context). mvm
+//  injects from a LISTENER context through the snif_sta: a GENERAL_
+//  PURPOSE station, zero address, its queue on tid IWL_MAX_TID_COUNT
+//  (8) under TVQM. Binding 4 (debug.itlawdl_txsta=4) is that object;
+//  run it with debug.itlawdl_cell=2 (LISTENER through the cell path:
+//  promisc, no FCS, frames consumed by the ring). No ACKs for the
+//  peer's unicast in LISTENER -- this proves TX, not the datapath.
+//
 //  With Wi-Fi turned OFF in macOS, `sysctl -w debug.itlawdl=2` restarts
 //  the firmware as a "cell" on channel 6: a PIBSS MAC context (Intel's
 //  pseudo-IBSS; a plain IBSS one receives nothing on this firmware) on
@@ -91,7 +102,9 @@
 //    debug.itlawdl_txsta  int rw   inject queue binding: 0 monitor
 //                                  (v2.5), 1 sta0 LINK (default), 2
 //                                  aux, 3 sta0 MULTICAST (v2.7.2,
-//                                  iwlwifi's bcast shape) -- read at
+//                                  iwlwifi's bcast shape), 4 mvm's
+//                                  snif_sta (GP, zero address, tid 8,
+//                                  no HT flags; v2.8) -- read at
 //                                  session start
 //    debug.itlawdl_stats  string   counters
 //    debug.itlawdl_rx     opaque   drains received frames: 16-byte
@@ -326,7 +339,7 @@ awdl_txsta_sysctl SYSCTL_HANDLER_ARGS
     int err = sysctl_handle_int(oidp, &v, 0, req);
     if (err || !req->newptr)
         return err;
-    if (v < 0 || v > 3)
+    if (v < 0 || v > 4)
         return EINVAL;
     /* takes effect at the next session start; the stats line says
      * which binding is live (txsta=). */
@@ -464,7 +477,7 @@ SYSCTL_PROC(_debug, OID_AUTO, itlawdl_cell, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_L
             "pin fw mac type for the next session: 0 auto (pibss), 4 ibss, 3 pibss, 2 listener");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_txsta, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_txsta_sysctl, "I",
-            "inject queue station binding: 0 monitor (v2.5), 1 sta0 LINK (default), 2 aux, 3 sta0 mcast (v2.7.2) -- read at session start");
+            "inject queue station binding: 0 monitor (v2.5), 1 sta0 LINK (default), 2 aux, 3 sta0 mcast (v2.7.2), 4 snif_sta tid 8 (v2.8) -- read at session start");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_stats_sysctl, "A",
             "itlwm AWDL session counters");
