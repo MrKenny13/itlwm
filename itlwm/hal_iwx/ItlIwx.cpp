@@ -3500,6 +3500,12 @@ int ItlIwx::
 iwx_tvqm_alloc_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t new_sta_mask)
 {
     int queue, generation = sc->sc_generation;
+    /* The firmware's management TID is 15; the host table has
+     * eight data slots and one management slot at index 8. */
+    const int tid_index = tid == IWX_MGMT_TID ? IWX_MAX_TID_COUNT : tid;
+    if (tid_index < 0 || tid_index >= (int)nitems(sc->sc_tid_data))
+        return -EINVAL;
+
     //TODO: Here is a bug, for gen3 devices which support 256 frame aggregate into 1 A-MPDU like ax210, if the TfDs count larger than 256 than it would trigger system freeze on macOS, don't know why but Linux can do this. Still need to dig deep into the code or optimize the DMA memory allocation, here I just limit the size to 256 as the temporary solution.
 #ifdef notyet
     int size = sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210 ? IWX_MIN_256_BA_QUEUE_SIZE_GEN3 : IWX_DEFAULT_QUEUE_SIZE;
@@ -3523,7 +3529,7 @@ iwx_tvqm_alloc_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t new_sta_mask
     
     if (queue < 0)
         return queue;
-    sc->sc_tid_data[tid].qid = queue;
+    sc->sc_tid_data[tid_index].qid = queue;
     return queue;
 }
 
