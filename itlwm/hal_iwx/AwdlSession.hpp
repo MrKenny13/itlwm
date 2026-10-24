@@ -268,6 +268,9 @@ struct awdl_session_state {
      * regardless, the stats and the log both say). */
     int notx_wanted;
     int prot;
+    /* v2.8.3: binding 8's TLC rate-scaling config result: 0 none,
+     * 1 sent, -1 refused. */
+    int tlc;
 
     /* rx ring: length-prefixed records, drained by debug.itlawdl_rx */
     uint8_t *ring;
@@ -408,7 +411,7 @@ awdl_txsta_sysctl SYSCTL_HANDLER_ARGS
     int err = sysctl_handle_int(oidp, &v, 0, req);
     if (err || !req->newptr)
         return err;
-    if (v < 0 || v > 7)
+    if (v < 0 || v > 8)
         return EINVAL;
     /* takes effect at the next session start; the stats line says
      * which binding is live (txsta=). */
@@ -446,7 +449,7 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         "fw_err=%llu fwid=0x%x il1=0x%x hcmd=0x%x txsta=%d(sta %d type %s tid %d qid %d want %d%s)\n"
         "umac id=0x%x il=0x%x d1=0x%x d2=0x%x d3=0x%x ch=0x%x\n"
         "lmac ld1=0x%x ld2=0x%x ld3=0x%x\n"
-        "state=%d cell=%d(want %d) channel=%d prot=%d notx=%d\n",
+        "state=%d cell=%d(want %d) channel=%d prot=%d tlc=%d notx=%d\n",
         gAwdl.rx, gAwdl.rx_bytes, gAwdl.rx_dropped, gAwdl.dup,
         gAwdl.action, gAwdl.psf, gAwdl.mif, gAwdl.other_action,
         gAwdl.data, gAwdl.data_bytes,
@@ -470,7 +473,7 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         (unsigned)gAwdl.fw_err_l_d1, (unsigned)gAwdl.fw_err_l_d2,
         (unsigned)gAwdl.fw_err_l_d3,
         gAwdl.session, gAwdl.cell, gAwdl.cell_wanted, gAwdl.channel,
-        gAwdl.prot, gAwdl.notx_wanted);
+        gAwdl.prot, gAwdl.tlc, gAwdl.notx_wanted);
     if (n < 0)
         return EIO;
     /* v2.7.1: a truncated snprintf returns the would-be length, which
@@ -568,7 +571,7 @@ SYSCTL_PROC(_debug, OID_AUTO, itlawdl_cell, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_L
             "pin fw mac type for the next session: 0 auto (pibss), 4 ibss, 3 pibss, 2 listener");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_txsta, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_txsta_sysctl, "I",
-            "inject queue station binding: 0 monitor (v2.5), 1 sta0 LINK (default), 2 aux, 3 sta0 mcast (v2.7.2), 4 snif_sta tid 8 (v2.8), 5 sta0 gp bcast tid 15 (v2.8.1), 6 = 5 + session protection, 7 sta0 LINK via TVQM (v2.8.2) -- read at session start");
+            "inject queue station binding: 0 monitor (v2.5), 1 sta0 LINK (default), 2 aux, 3 sta0 mcast (v2.7.2), 4 snif_sta tid 8 (v2.8), 5 sta0 gp bcast tid 15 (v2.8.1), 6 = 5 + session protection, 7 sta0 LINK via TVQM (v2.8.2), 8 = 7 + TLC rate-scaling (v2.8.3) -- read at session start");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_notx, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_notx_sysctl, "I",
             "v2.8.1: 1 = hold injected frames before the TFD (the session without emission, kext-side; held= counts) -- read live");

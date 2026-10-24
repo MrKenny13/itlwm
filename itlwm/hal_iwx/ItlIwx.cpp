@@ -7574,6 +7574,22 @@ awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type, int *tid)
         *sta_type = IWX_STA_GENERAL_PURPOSE;
         *tid = IWX_MAX_TID_COUNT;
         break;
+    case 8:
+        /* v2.8.3: binding 7 (sta 0 LINK, TVQM queue) + a TLC
+         * rate-scaling config for the station (iwx_rs_init), the one
+         * command the working native TX path sends that the AWDL
+         * monitor branch never did. The v2.8.2 run proved the kill is
+         * the TX kick, not the setup: the session (context+sta+TVQM
+         * queue) ran 2 min clean with --sans-emission, and the TX
+         * command is byte-identical to native iwx_tx -- so what the fw
+         * is missing is station-side state it reads at transmit time.
+         * TLC is the prime suspect: the fw ACKs the peer autonomously
+         * (no TLC needed) but asserts the moment it dequeues a
+         * host TFD for a station with no rate-scaling context. */
+        *sta_id = IWX_STATION_ID;
+        *sta_type = IWX_STA_LINK;
+        *tid = IWX_MAX_TID_COUNT;
+        break;
     case 7:
         /* v2.8.2: binding 1's station (sta 0 LINK, our MAC) but its
          * queue is allocated through TVQM (iwx_tvqm_alloc_txq, the fw
@@ -9997,7 +10013,7 @@ iwx_auth(struct iwx_softc *sc)
          * station (awdl_tx_sta_shape). */
         int sid, stype, stid;
         awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype, &stid);
-        if (sc->sc_awdl_tx_sta == 7) {
+        if (sc->sc_awdl_tx_sta == 7 || sc->sc_awdl_tx_sta == 8) {
             /* v2.8.2: let the fw allocate the queue (TVQM), the gen3
              * way, instead of the static fixed qid 2. The returned qid
              * is stored for the inject/completion paths. */
@@ -10010,6 +10026,16 @@ iwx_auth(struct iwx_softc *sc)
             sc->sc_awdl_inject_qid = q;
             XYLog("itlawdl: TVQM inject queue = %d (sta %d tid %d)\n",
                   q, sid, stid);
+            if (sc->sc_awdl_tx_sta == 8) {
+                /* v2.8.3: give the station a rate-scaling (TLC) context,
+                 * the command the native TX path sends and the AWDL
+                 * branch never did. A failure is logged and survived --
+                 * the session still comes up and the stats show it. */
+                int rerr = iwx_rs_init(sc, in, true);
+                gAwdl.tlc = rerr ? -1 : 1;
+                if (rerr)
+                    XYLog("itlawdl: TLC config refused (%d) -- continuing\n", rerr);
+            }
             return 0;
         }
         /* v2.8: the tid is the binding's (8 for the snif_sta). */
@@ -14376,6 +14402,7 @@ awdlSessionSetGated(int target, int cell_wanted)
      * fw's TVQM pick in iwx_auth. */
     sc->sc_awdl_inject_qid = IWX_DQA_INJECT_MONITOR_QUEUE;
     gAwdl.prot = 0;    /* v2.8.1: binding 6 sets it in iwx_auth */
+    gAwdl.tlc = 0;     /* v2.8.3: binding 8 sets it in iwx_auth */
     gAwdl.session = target;
     sc->sc_awdl_session = target;
 
