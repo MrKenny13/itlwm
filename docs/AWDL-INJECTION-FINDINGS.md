@@ -262,3 +262,38 @@ Conclusion : finir = porter une part bien plus large du bring-up iwlmld
 entièrement en nouvelle API depuis le chargement du firmware. C'est un
 portage conséquent et itératif (chaque essai = un reboot). Tous les
 octets sont dans hcmd-bytes ; ce qui manque est l'orchestration large.
+
+---
+
+## v2.8.9 — analyse octet-par-octet de la capture owly + 3 commandes intercalées
+
+Décodage complet de `hcmd-bytes` (283 commandes). Résultats fermes :
+
+### Ce qui est CONFIRMÉ fidèle (donc pas la cause)
+- `mld_sta_bcast` = STA_CONFIG owly idx 96 : sta_id=2, peer=BSSID AWDL,
+  **station_type=1 (BCAST_MGMT)** — identique.
+- File d'injection = SCD_QUEUE_CONFIG owly idx 97 : op=ADD,
+  **sta_mask=0x4 (BIT2), tid=15** — identique à notre 2ᵉ tvqm_alloc.
+- `mld_link_mod3` / `mld_link_mod4` = owly idx 93 / idx 98 **à l'octet
+  près** (champ +24 = 0xde puis 0x0e ; +28 = 1 = actif).
+- Ordre sta_mcast → queue → sta_bcast → queue → link_mod = owly 94→98.
+- **TLC écarté** : owly n'envoie AUCUN TLC_MNG_CONFIG (5.0f) pour les
+  stations mcast (1) / bcast (2) ; seulement pour les vrais pairs
+  (sta 0/3/4, type 0). Donc pas de TLC manquant sur l'injection.
+
+### Ce qu'owly envoie dans la fenêtre #82-98 et qu'on OMETTAIT
+Séquence owly exacte : 82 MAC, 83 LINK_ADD, **85 PHY_CTX(ADD ch6)**,
+86 RLC, 87/88 LINK_MOD, **89 LONG 0x9f**, **90 PHY_CTX(MODIFY ch6)**,
+91 RLC, 92 BEACON, 93 LINK_MOD, 94/95 sta+queue, 96/97 sta+queue,
+98 LINK_MOD. Les PHY_CONTEXT legacy (0x08/0x01) : champ +4 = action
+(1=ADD, 2=MODIFY), +8 = canal. owly **re-touche le PHY deux fois à
+l'intérieur** du montage du link — nous ne l'envoyions qu'une fois,
+avant mac_add.
+
+v2.8.9 rend le replay fidèle : phy MODIFY après link_add (idx 85),
+0x9f non-fatal (idx 89), phy MODIFY après link_mod2 (idx 90) — ce
+dernier commit la liaison PHY↔link juste avant rlc2/beacon. Hypothèse
+testée : sans ce MODIFY post-link, le fw accepte la config mais ne
+planifie jamais la file (done=0). Si v2.8.9 ne change pas done=0, la
+fenêtre #82-98 est épuisée et le manque restant est bien l'état global
+nouvelle-API (boot iwlmld complet, idx 0-81).

@@ -10153,6 +10153,16 @@ static const uint8_t mld_link_mod4[208] = {
 };
 
 
+/* 1.9f len 44 -- owly idx 89, a LONG-group 0x9f (reduce-tx-power, the
+ * 0x7fff "no reduction" value at +8). Sent verbatim between link_mod2
+ * and the post-link phy MODIFY, exactly where owly places it. */
+static const uint8_t mld_cmd_9f[44] = {
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x7f,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+};
+
 static const uint8_t mld_owly_mac[6] = { 0x40, 0xd1, 0x33, 0x7a, 0x3e, 0xd3 };
 
 /* copy a template, patch every owly-MAC occurrence to ours. */
@@ -10191,13 +10201,36 @@ iwx_awdl_mld_inject_setup(struct iwx_softc *sc, struct iwx_node *in)
     if (err) { XYLog("itlawdl: MLD " #TMPL " failed %d\n", err); return err; } \
 } while (0)
 
-    MLD_SEND(mac_add,   0x3, 0x8);
-    MLD_SEND(link_add,  0x3, 0x9);
-    MLD_SEND(rlc1,      0x5, 0x8);
-    MLD_SEND(link_mod1, 0x3, 0x9);
-    MLD_SEND(link_mod2, 0x3, 0x9);
-    MLD_SEND(rlc2,      0x5, 0x8);
-    MLD_SEND(beacon,    0x1, 0x91);
+    MLD_SEND(mac_add,   0x3, 0x8);     /* owly idx 82 */
+    MLD_SEND(link_add,  0x3, 0x9);     /* owly idx 83 */
+    /* v2.8.9: owly idx 85 -- it re-touches phy 0 (MODIFY, ch6) right
+     * after the link is added. We previously only did phy ctxt once,
+     * before mac_add, and never again. The capture shows two more phy
+     * touches inside the link setup; replay both faithfully. */
+    err = iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[0], ic->ic_ibss_chan,
+                              1, 1, 0);
+    if (err) { XYLog("itlawdl: MLD phy re-touch(a) failed %d\n", err); return err; }
+    MLD_SEND(rlc1,      0x5, 0x8);     /* owly idx 86 */
+    MLD_SEND(link_mod1, 0x3, 0x9);     /* owly idx 87 */
+    MLD_SEND(link_mod2, 0x3, 0x9);     /* owly idx 88 */
+    /* v2.8.9: owly idx 89 -- a LONG 0x9f (reduce-tx-power, "no
+     * reduction"). Non-fatal: logged and survived like prot/tlc. */
+    {
+        uint8_t b9f[sizeof(mld_cmd_9f)];
+        int n9 = mld_patch(b9f, mld_cmd_9f, (int)sizeof(mld_cmd_9f), mymac);
+        int e9 = iwx_send_cmd_pdu(sc, iwx_cmd_id(0x9f, 0x1, 0), 0,
+                                  (uint16_t)n9, b9f);
+        if (e9) XYLog("itlawdl: MLD 0x9f refused %d -- continuing\n", e9);
+    }
+    /* v2.8.9: owly idx 90 -- the phy MODIFY AFTER the link is fully
+     * shaped (and after 0x9f). This is the step that commits the
+     * phy<->link binding right before rlc2/beacon; without it the fw
+     * accepts the config but never schedules the inject queue (done=0). */
+    err = iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[0], ic->ic_ibss_chan,
+                              1, 1, 0);
+    if (err) { XYLog("itlawdl: MLD phy re-touch(b) failed %d\n", err); return err; }
+    MLD_SEND(rlc2,      0x5, 0x8);     /* owly idx 91 */
+    MLD_SEND(beacon,    0x1, 0x91);    /* owly idx 92 */
     MLD_SEND(link_mod3, 0x3, 0x9);
     MLD_SEND(sta_mcast, 0x3, 0xa);
     /* mcast station queue: sta_mask BIT(1), tid 0 */
