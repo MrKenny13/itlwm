@@ -187,11 +187,13 @@ pub fn radio_fw_err() -> Option<u64> {
 
 /// A firmware error dump's numbers, off the kext's stats (v2.7.2+
 /// kexts): the session's FIRST dump — the assert that killed it, not
-/// the corpse's later ones. The LMAC half (fwid=, il1=, hcmd=) and the
-/// UMAC half (umac id=/il=/d1=/d2=/d3=/ch=): the UMAC owns the
-/// stations and queues, its data1-3 name what it choked on. A kext
-/// too old to say them reads back as all zeros; `None` when the stats
-/// carry no dump identity at all.
+/// the corpse's later ones. The LMAC half (fwid=, il1=, hcmd=, and
+/// v2.8.1's ld1=/ld2=/ld3= — the LMAC's own data1-3, the block where
+/// a relayed 0x71 usually hides its real fault) and the UMAC half
+/// (umac id=/il=/d1=/d2=/d3=/ch=): the UMAC owns the stations and
+/// queues, its data1-3 name what it choked on. A kext too old to say
+/// them reads back as all zeros; `None` when the stats carry no dump
+/// identity at all.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FwDump {
     pub fwid: u32,
@@ -203,6 +205,9 @@ pub struct FwDump {
     pub u_d2: u32,
     pub u_d3: u32,
     pub u_ch: u32,
+    pub l_d1: u32,
+    pub l_d2: u32,
+    pub l_d3: u32,
 }
 
 fn hex_u32(v: &str) -> Option<u32> {
@@ -239,6 +244,11 @@ pub fn radio_fw_dump() -> Option<FwDump> {
                         "d2" => d.u_d2 = n,
                         "d3" => d.u_d3 = n,
                         "ch" => d.u_ch = n,
+                        // v2.8.1: the lmac line, its own keys so the
+                        // umac values keep theirs
+                        "ld1" => d.l_d1 = n,
+                        "ld2" => d.l_d2 = n,
+                        "ld3" => d.l_d3 = n,
                         _ => {}
                     }
                 }

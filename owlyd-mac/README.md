@@ -152,6 +152,39 @@ station's type in the txsta line. The daemon's side: the crash message
 prints the actual values (it said "fwid=/il1=/hcmd=" since v0.2.0
 shipped it as a literal), and parses the UMAC half to say it.
 
+v0.2.2/v0.2.3 ride the v11 run's verdict — and the review that came
+back from two directions at once. The binding-3 test (mcast station)
+died the identical death (fwid=0x71, same interrupt link, same command
+word), and the UMAC table the run finally carried said almost nothing
+(d1=0x2, d2=0x0, d3=0xdeadbeef — a field the firmware never wrote).
+The decisive number was an old one: done=0 with ok=10 — across four
+bindings the firmware NEVER serviced the inject queue, so nothing we
+injected ever reached the air and the station axis was never the
+operative variable.
+
+The daemon grew `--sans-emission` (the control run: the session and
+the engine live, not one frame is sent — fw_err climbing anyway blames
+the context, not TX), `--liaison N` and `--cellule N` (the two sysctls,
+said on the command line). The kext grew, in two passes: binding 4
+(mvm's snif_sta — a GENERAL_PURPOSE station, zero address, tid 8, no
+HT flags, meant for a LISTENER cell), then the verified second shape:
+there is no "STATION_TYPE_BCAST_MGMT = 1" anywhere in iwlwifi — Linux
+master still carries this driver's own enum, and commit ced19f26 types
+the vif's broadcast station GENERAL_PURPOSE, the one mvm/tx.c hands
+ADHOC management frames to. Binding 5 (`--liaison 5`) is binding 3
+with only the type changed again (mcast → gp): sta 0, broadcast
+address, queue 2, tid 15, on the PIBSS cell. Binding 6 (`--liaison 6`)
+is binding 5 plus the one thing the working STA path does that the
+session never did — a session protection (the firmware advertises the
+capability; `prot=` in the stats says what it did with it). The kext
+also has its own, lower-layer control: `sysctl -w
+debug.itlawdl_notx=1` makes it hold every injected frame before the
+TFD (`held=` counts them) — the same experiment as `--sans-emission`,
+but the writes reach the kext. And the stats grow the first dump's
+LMAC data1-3 (`lmac ld1=… ld2=… ld3=…`) — the 0x71 NMI is the UMAC
+relaying another block's death, and the LMAC half usually names the
+real fault; the daemon parses it and the crash message says it.
+
 ## Credits
 
 - [owly](https://github.com/t4t5/owly) (MIT): the AWDL engine — sync,

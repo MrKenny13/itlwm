@@ -84,6 +84,34 @@
 //  promisc, no FCS, frames consumed by the ring). No ACKs for the
 //  peer's unicast in LISTENER -- this proves TX, not the datapath.
 //
+//  v2.8.1: the v11 run killed binding 3 (mcast) the same way it
+//  killed 0/1/2, and done=0 across all of them -- the firmware
+//  NEVER serviced the inject queue, so nothing we injected ever
+//  reached the air and the station axis was never the operative
+//  variable. Two more canonical shapes verified off the sources:
+//  (a) this fw advertises TLV API_STA_TYPE (parsed out of its own
+//  ucode), so station_type is honored -- and Linux master's
+//  fw/api/sta.h still carries this driver's enum (no
+//  "STATION_TYPE_BCAST_MGMT" exists); commit ced19f26 types the vif's
+//  BROADCAST station GENERAL_PURPOSE, the one mvm/tx.c hands ADHOC
+//  management frames to. Binding 5 is binding 3 with only the type
+//  changed again (mcast -> gp): sta 0, ff:ff:ff:ff:ff:ff, queue 2,
+//  tid 15 -- the ADHOC-broadcast shape, on the PIBSS cell.
+//  (b) the one thing the working STA path does that the session never
+//  did: a session protection (CAPA SESSION_PROT_CMD is set in this
+//  fw). Binding 6 = binding 5 + iwx_schedule_protect_session; prot=
+//  in the stats says what the fw did with it (1 taken, -1 refused).
+//  And the discriminator, kext-side this time: debug.itlawdl_notx=1
+//  makes awdlInject hold every frame BEFORE the TFD (held= counts
+//  them) -- the same experiment as the daemon's --sans-emission one
+//  layer lower: the writes reach the kext, the TFDs stay unwritten.
+//  If the fw still dies in a notx run, the TX path is innocent and
+//  the bomb is the session's own machinery. The stats also grow the
+//  first dump's LMAC data1-3 (lmac ld1=/ld2=/ld3= -- distinct keys so
+//  the daemon's UMAC parse keeps its own: the 0x71 NMI is the UMAC
+//  relaying another block's death, and the LMAC half usually names
+//  the real fault).
+//
 //  With Wi-Fi turned OFF in macOS, `sysctl -w debug.itlawdl=2` restarts
 //  the firmware as a "cell" on channel 6: a PIBSS MAC context (Intel's
 //  pseudo-IBSS; a plain IBSS one receives nothing on this firmware) on
@@ -104,8 +132,14 @@
 //                                  aux, 3 sta0 MULTICAST (v2.7.2,
 //                                  iwlwifi's bcast shape), 4 mvm's
 //                                  snif_sta (GP, zero address, tid 8,
-//                                  no HT flags; v2.8) -- read at
-//                                  session start
+//                                  no HT flags; v2.8), 5 sta0 GP
+//                                  broadcast tid 15 (v2.8.1, mvm's
+//                                  bcast_sta), 6 = 5 + session
+//                                  protection -- read at session start
+//    debug.itlawdl_notx   int rw   v2.8.1: 1 = hold injected frames
+//                                  before the TFD (held= counts them)
+//                                  -- the discriminator, kext-side;
+//                                  read live
 //    debug.itlawdl_stats  string   counters
 //    debug.itlawdl_rx     opaque   drains received frames: 16-byte
 //                                  header (u16 len, u8 rate, i8 rssi,
@@ -171,6 +205,11 @@ struct awdl_session_state {
      * read 243 at daemon start: the boot-time queue, not ours). */
     uint64_t inject_ok, inject_err, inject_bytes;
     uint64_t inject_done, inject_recycled;
+    /* v2.8.1: frames dropped by debug.itlawdl_notx before the TFD --
+     * a held frame is neither ok (it never queued) nor err (nothing
+     * refused it); the discriminator run reads it as "the session
+     * ran, emission held, fw watched". */
+    uint64_t inject_held;
     uint64_t inject_done_err;
     uint32_t inject_last_status;
     /* v2.7: the last rate_n_flags handed to the firmware (txrate=) --
@@ -189,6 +228,12 @@ struct awdl_session_state {
      * to kprintf only before, which a field log never reads. */
     uint32_t fw_err_u_id, fw_err_u_il1, fw_err_u_d1, fw_err_u_d2,
               fw_err_u_d3, fw_err_u_ch;
+    /* v2.8.1: the same first dump's LMAC data1-3. The 0x71 NMI is the
+     * UMAC relaying another block's death -- the LMAC half usually
+     * names the real fault -- and the v11 run's LMAC half only ever
+     * fed kprintf. ld1=/ld2=/ld3= in the stats so they cannot collide
+     * with the umac d1=/d2=/d3= the daemon parses. */
+    uint32_t fw_err_l_d1, fw_err_l_d2, fw_err_l_d3;
 
     /* v2.6: the binding this session's inject queue came up on
      * (tx_sta = debug.itlawdl_txsta's value at session start;
@@ -199,6 +244,13 @@ struct awdl_session_state {
     int tx_sta_wanted;
     int tx_sta, tx_sta_id, tx_tid;
     int tx_sta_type;
+    /* v2.8.1 knobs, never reset with the counters: notx_wanted is the
+     * kext-side discriminator flag (debug.itlawdl_notx); prot says
+     * what binding 6's session protection got -- 0 none requested,
+     * 1 the fw took it, -1 it refused (the session runs on
+     * regardless, the stats and the log both say). */
+    int notx_wanted;
+    int prot;
 
     /* rx ring: length-prefixed records, drained by debug.itlawdl_rx */
     uint8_t *ring;
@@ -339,7 +391,7 @@ awdl_txsta_sysctl SYSCTL_HANDLER_ARGS
     int err = sysctl_handle_int(oidp, &v, 0, req);
     if (err || !req->newptr)
         return err;
-    if (v < 0 || v > 4)
+    if (v < 0 || v > 6)
         return EINVAL;
     /* takes effect at the next session start; the stats line says
      * which binding is live (txsta=). */
@@ -348,26 +400,44 @@ awdl_txsta_sysctl SYSCTL_HANDLER_ARGS
 }
 
 static int
+awdl_notx_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = gAwdl.notx_wanted;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr)
+        return err;
+    if (v != 0 && v != 1)
+        return EINVAL;
+    /* v2.8.1: read live by awdlInject -- set it before a run and the
+     * session builds every context, station and queue as usual, only
+     * no TFD is ever written. held= in the stats counts the drops. */
+    gAwdl.notx_wanted = v;
+    return 0;
+}
+
+static int
 awdl_stats_sysctl SYSCTL_HANDLER_ARGS
 {
-    static char buf[768];
+    static char buf[896];
     int n;
 
     n = snprintf(buf, sizeof(buf),
         "rx=%llu bytes=%llu dropped=%llu dup=%llu\n"
         "awdl action=%llu psf=%llu mif=%llu other=%llu data=%llu data_bytes=%llu\n"
         "peer %02x:%02x:%02x:%02x:%02x:%02x rssi=%d\n"
-        "inject ok=%llu err=%llu bytes=%llu done=%llu recycled=%llu done_err=%llu last=0x%x txrate=0x%x\n"
-        "fw_err=%llu fwid=0x%x il1=0x%x hcmd=0x%x txsta=%d(sta %d type %s tid %d want %d)\n"
+        "inject ok=%llu err=%llu held=%llu bytes=%llu done=%llu recycled=%llu done_err=%llu last=0x%x txrate=0x%x\n"
+        "fw_err=%llu fwid=0x%x il1=0x%x hcmd=0x%x txsta=%d(sta %d type %s tid %d want %d%s)\n"
         "umac id=0x%x il=0x%x d1=0x%x d2=0x%x d3=0x%x ch=0x%x\n"
-        "state=%d cell=%d(want %d) channel=%d\n",
+        "lmac ld1=0x%x ld2=0x%x ld3=0x%x\n"
+        "state=%d cell=%d(want %d) channel=%d prot=%d notx=%d\n",
         gAwdl.rx, gAwdl.rx_bytes, gAwdl.rx_dropped, gAwdl.dup,
         gAwdl.action, gAwdl.psf, gAwdl.mif, gAwdl.other_action,
         gAwdl.data, gAwdl.data_bytes,
         gAwdl.peer[0], gAwdl.peer[1], gAwdl.peer[2],
         gAwdl.peer[3], gAwdl.peer[4], gAwdl.peer[5],
         gAwdl.peer_rssi,
-        gAwdl.inject_ok, gAwdl.inject_err, gAwdl.inject_bytes,
+        gAwdl.inject_ok, gAwdl.inject_err, gAwdl.inject_held,
+        gAwdl.inject_bytes,
         gAwdl.inject_done, gAwdl.inject_recycled,
         gAwdl.inject_done_err, (unsigned)gAwdl.inject_last_status,
         (unsigned)gAwdl.inject_rate_nf,
@@ -376,10 +446,14 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         gAwdl.tx_sta, gAwdl.tx_sta_id,
         awdl_sta_type_name(gAwdl.tx_sta_type),
         gAwdl.tx_tid, gAwdl.tx_sta_wanted,
+        gAwdl.prot > 0 ? " prot" : "",
         (unsigned)gAwdl.fw_err_u_id, (unsigned)gAwdl.fw_err_u_il1,
         (unsigned)gAwdl.fw_err_u_d1, (unsigned)gAwdl.fw_err_u_d2,
         (unsigned)gAwdl.fw_err_u_d3, (unsigned)gAwdl.fw_err_u_ch,
-        gAwdl.session, gAwdl.cell, gAwdl.cell_wanted, gAwdl.channel);
+        (unsigned)gAwdl.fw_err_l_d1, (unsigned)gAwdl.fw_err_l_d2,
+        (unsigned)gAwdl.fw_err_l_d3,
+        gAwdl.session, gAwdl.cell, gAwdl.cell_wanted, gAwdl.channel,
+        gAwdl.prot, gAwdl.notx_wanted);
     if (n < 0)
         return EIO;
     /* v2.7.1: a truncated snprintf returns the would-be length, which
@@ -477,7 +551,10 @@ SYSCTL_PROC(_debug, OID_AUTO, itlawdl_cell, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_L
             "pin fw mac type for the next session: 0 auto (pibss), 4 ibss, 3 pibss, 2 listener");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_txsta, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_txsta_sysctl, "I",
-            "inject queue station binding: 0 monitor (v2.5), 1 sta0 LINK (default), 2 aux, 3 sta0 mcast (v2.7.2), 4 snif_sta tid 8 (v2.8) -- read at session start");
+            "inject queue station binding: 0 monitor (v2.5), 1 sta0 LINK (default), 2 aux, 3 sta0 mcast (v2.7.2), 4 snif_sta tid 8 (v2.8), 5 sta0 gp bcast tid 15 (v2.8.1), 6 = 5 + session protection -- read at session start");
+SYSCTL_PROC(_debug, OID_AUTO, itlawdl_notx, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            NULL, 0, awdl_notx_sysctl, "I",
+            "v2.8.1: 1 = hold injected frames before the TFD (the session without emission, kext-side; held= counts) -- read live");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_stats_sysctl, "A",
             "itlwm AWDL session counters");
@@ -502,6 +579,7 @@ awdl_session_attach(void)
         sysctl_register_oid(&sysctl__debug_itlawdl);
         sysctl_register_oid(&sysctl__debug_itlawdl_cell);
         sysctl_register_oid(&sysctl__debug_itlawdl_txsta);
+        sysctl_register_oid(&sysctl__debug_itlawdl_notx);
         sysctl_register_oid(&sysctl__debug_itlawdl_stats);
         sysctl_register_oid(&sysctl__debug_itlawdl_rx);
         sysctl_register_oid(&sysctl__debug_itlawdl_tx);
@@ -522,6 +600,7 @@ awdl_session_detach(ItlIwx *iwx)
         sysctl_unregister_oid(&sysctl__debug_itlawdl);
         sysctl_unregister_oid(&sysctl__debug_itlawdl_cell);
         sysctl_unregister_oid(&sysctl__debug_itlawdl_txsta);
+        sysctl_unregister_oid(&sysctl__debug_itlawdl_notx);
         sysctl_unregister_oid(&sysctl__debug_itlawdl_stats);
         sysctl_unregister_oid(&sysctl__debug_itlawdl_rx);
         sysctl_unregister_oid(&sysctl__debug_itlawdl_tx);

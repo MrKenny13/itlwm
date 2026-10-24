@@ -527,10 +527,14 @@ impl Opts {
                 "--cellule" | "--cell" => o.cell = Some(num(&a, args.next())?),
                 "-h" | "--help" | "--aide" => {
                     println!(
-                        "usage : sudo ./owlyd-mac [--sans-emission] [--liaison 0-4] [--cellule 0|2|3|4]\n\
+                        "usage : sudo ./owlyd-mac [--sans-emission] [--liaison 0-6] [--cellule 0|2|3|4]\n\
                          \x20 --sans-emission  contrôle : la session tourne, rien n'est émis\n\
-                         \x20 --liaison N      debug.itlawdl_txsta (4 = snif_sta d'iwlwifi, kext 2.8)\n\
-                         \x20 --cellule N      debug.itlawdl_cell (0 auto/pibss, 2 listener, 3 pibss, 4 ibss)"
+                         \x20 --liaison N      debug.itlawdl_txsta (0 monitor, 1 sta0 link, 2 aux,\n\
+                         \x20                   3 mcast, 4 snif_sta d'iwlwifi [kext 2.8],\n\
+                         \x20                   5 bcast_sta gp tid 15 [kext 2.8.1], 6 = 5 + protection)\n\
+                         \x20 --cellule N      debug.itlawdl_cell (0 auto/pibss, 2 listener, 3 pibss, 4 ibss)\n\
+                         \x20 le kext a aussi debug.itlawdl_notx=1 : le même contrôle, une couche\n\
+                         \x20 plus bas (les écritures atteignent le kext, aucun TFD n'est écrit ; held=)"
                     );
                     std::process::exit(0);
                 }

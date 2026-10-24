@@ -7525,7 +7525,31 @@ iwx_disable_beacon_filter(struct iwx_softc *sc)
  * on a LINK/AUX station, a shape mvm never builds; 0 was the snif shape
  * on tid 15. Meant for `debug.itlawdl_cell=2` (a LISTENER context
  * through the cell path: promisc, no FCS, frames consumed by the ring),
- * the context mvm injects from. */
+ * the context mvm injects from.
+ *
+ * v2.8.1: the v11 run's verdict, and the second canonical shape.
+ * Binding 3 (mcast, v2.7.2) died the same death as 0/1/2 -- and with
+ * done=0 across all of them, so the fw NEVER serviced the inject
+ * queue and the station axis was likely never the operative variable
+ * (what the run's new UMAC fields said -- d1=0x2 d2=0x0
+ * d3=0xdeadbeef -- was almost nothing). Verified off the sources
+ * before this commit: this fw advertises TLV API_STA_TYPE (parsed
+ * out of its own ucode), so station_type is honored; Linux master's
+ * fw/api/sta.h still carries this driver's enum (there is no
+ * "STATION_TYPE_BCAST_MGMT" anywhere), and commit ced19f26 types the
+ * vif's BROADCAST station GENERAL_PURPOSE -- the one mvm/tx.c hands
+ * ADHOC management frames to (tx_skb_non_sta: !is_data -> bcast_sta).
+ * So binding 5 is binding 3 with only the type changed again
+ * (mcast -> gp): sta 0, address ff:ff:ff:ff:ff:ff, queue 2, tid 15
+ * -- the ADHOC-broadcast shape on the PIBSS cell. And binding 6 is
+ * binding 5 plus the one thing the working STA path does that the
+ * session never did -- a session protection (CAPA SESSION_PROT_CMD
+ * is set in this fw; iwx_auth's monitor branch always returned
+ * before it). Without an on-channel window the fw may simply never
+ * schedule the queue: done=0 exactly. debug.itlawdl_notx (kext-side,
+ * held= counts) is the same discriminator as the daemon's
+ * --sans-emission, one layer lower: the writes reach the kext, the
+ * TFDs stay unwritten. */
 static void
 awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type, int *tid)
 {
@@ -7549,6 +7573,17 @@ awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type, int *tid)
         *sta_id = IWX_MONITOR_STA_ID;
         *sta_type = IWX_STA_GENERAL_PURPOSE;
         *tid = IWX_MAX_TID_COUNT;
+        break;
+    case 5:
+    case 6:
+        /* v2.8.1: iwlwifi's bcast_sta -- the vif's broadcast station
+         * is typed GENERAL_PURPOSE (ced19f26), and mvm/tx.c hands
+         * ADHOC management frames to it. Binding 3's exact shape
+         * except the type (mcast -> gp): sta 0, broadcast address,
+         * queue 2, tid 15, on the PIBSS cell. Binding 6 adds only
+         * the session protection (iwx_auth, monitor branch). */
+        *sta_id = IWX_STATION_ID;
+        *sta_type = IWX_STA_GENERAL_PURPOSE;
         break;
     default:
         *sta_id = IWX_MONITOR_STA_ID;
@@ -7595,9 +7630,9 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
             IEEE80211_ADDR_COPY(&add_sta_cmd.addr,
                                 etheranyaddr);
         else if (ic->ic_opmode == IEEE80211_M_MONITOR &&
-                 sc->sc_awdl_tx_sta == 3)
-            /* v2.7.2: binding 3 is the mcast station, and a mcast
-             * station carries the broadcast, the way iwlwifi's do. */
+                 (sc->sc_awdl_tx_sta == 3 || sc->sc_awdl_tx_sta >= 5))
+            /* v2.7.2 (binding 3) and v2.8.1 (bindings 5/6, the bcast
+             * station): a broadcast station carries the broadcast. */
             IEEE80211_ADDR_COPY(&add_sta_cmd.addr,
                                 etherbroadcastaddr);
         else if (ic->ic_opmode == IEEE80211_M_MONITOR)
@@ -9955,6 +9990,23 @@ iwx_auth(struct iwx_softc *sc)
                              sc->txq[IWX_DQA_INJECT_MONITOR_QUEUE].ring_count);
         if (err)
             goto rm_sta;
+        /* itlawdl v2.8.1: binding 6 adds the one thing the working
+         * STA path does that this branch always skipped -- a session
+         * protection (this fw advertises CAPA SESSION_PROT_CMD). The
+         * STA-mode protection is what keeps the fw on-channel while
+         * association traffic flies; without an on-channel window the
+         * fw may simply never schedule the inject queue, which is
+         * done=0 exactly (four bindings' worth of it). Duration 200
+         * mirrors the STA path on a 100-TU beacon interval -- a
+         * field-proven value on this very card. A refusal is logged
+         * and survived: the session runs on, the stats' prot= says
+         * which way it went. */
+        if (sc->sc_awdl_tx_sta == 6) {
+            err = iwx_schedule_protect_session(sc, in, 200);
+            gAwdl.prot = err ? -1 : 1;
+            if (err)
+                XYLog("itlawdl: session protection refused (%d) -- continuing\n", err);
+        }
         return 0;
     }
     
@@ -11567,6 +11619,15 @@ iwx_nic_error(struct iwx_softc *sc)
         gAwdl.fw_err_id = table.error_id;
         gAwdl.fw_err_il1 = table.ilink1;
         gAwdl.fw_err_hcmd = table.hcmd;
+        /* v2.8.1: the LMAC's own naming fields too -- the 0x71 NMI is
+         * the UMAC relaying another block's death, and iwlwifi's
+         * error-table lore says to look for the real fault in the
+         * other MAC. The v11 run's UMAC half (d1=0x2 d2=0x0
+         * d3=0xdeadbeef) said almost nothing; this half only ever fed
+         * kprintf, which a field log never reads. */
+        gAwdl.fw_err_l_d1 = table.data1;
+        gAwdl.fw_err_l_d2 = table.data2;
+        gAwdl.fw_err_l_d3 = table.data3;
     }
 
     if (ERROR_START_OFFSET <= table.valid * ERROR_ELEM_SIZE) {
@@ -14282,6 +14343,7 @@ awdlSessionSetGated(int target, int cell_wanted)
      * read here so a write between sessions takes effect on the next
      * one). */
     sc->sc_awdl_tx_sta = gAwdl.tx_sta_wanted;
+    gAwdl.prot = 0;    /* v2.8.1: binding 6 sets it in iwx_auth */
     gAwdl.session = target;
     sc->sc_awdl_session = target;
 
@@ -14405,6 +14467,17 @@ awdlInject(const uint8_t *req, size_t reqlen)
     if (!gAwdl.session) {
         gAwdl.inject_err++;
         return ENXIO;
+    }
+    /* v2.8.1: the discriminator, kext-side (the daemon's
+     * --sans-emission is the same experiment one layer up: there the
+     * write never reaches us). debug.itlawdl_notx holds the frame
+     * BEFORE the mbuf and the node reference -- nothing queues, the
+     * session's context/station/queue machinery all stay up, and
+     * held= counts it. If the fw still dies in a notx run, the TX
+     * path is innocent and the bomb is the session's own setup. */
+    if (gAwdl.notx_wanted) {
+        gAwdl.inject_held++;
+        return 0;
     }
 
     if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || m == NULL)
