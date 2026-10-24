@@ -3497,7 +3497,7 @@ out:
 }
 
 int ItlIwx::
-iwx_tvqm_alloc_txq(struct iwx_softc *sc, int tid, int ssn)
+iwx_tvqm_alloc_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t new_sta_mask)
 {
     int queue, generation = sc->sc_generation;
     //TODO: Here is a bug, for gen3 devices which support 256 frame aggregate into 1 A-MPDU like ax210, if the TfDs count larger than 256 than it would trigger system freeze on macOS, don't know why but Linux can do this. Still need to dig deep into the code or optimize the DMA memory allocation, here I just limit the size to 256 as the temporary solution.
@@ -3508,7 +3508,7 @@ iwx_tvqm_alloc_txq(struct iwx_softc *sc, int tid, int ssn)
 #endif
     
     do {
-        queue = iwx_tvqm_enable_txq(sc, tid, ssn, size);
+        queue = iwx_tvqm_enable_txq(sc, tid, ssn, size, new_sta_mask);
         if (generation != sc->sc_generation)
             return -ENXIO;
 #ifdef AIRPORT_VTD
@@ -3528,16 +3528,17 @@ iwx_tvqm_alloc_txq(struct iwx_softc *sc, int tid, int ssn)
 }
 
 int ItlIwx::
-iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
+iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size,
+                    uint32_t new_sta_mask)
 {
 #ifdef AIRPORT_VTD
     if (!getMainWorkLoop()->inGate()) {
-        struct Request { iwx_softc *sc; int tid; int ssn; uint32_t size; } request = {sc, tid, ssn, size};
+        struct Request { iwx_softc *sc; int tid; int ssn; uint32_t size; uint32_t new_sta_mask; } request = {sc, tid, ssn, size, new_sta_mask};
         return getMainCommandGate()->runAction(
             [](OSObject *, void *arg0, void *arg1, void *, void *) -> IOReturn {
                 auto request = static_cast<Request *>(arg1);
                 return static_cast<ItlIwx *>(arg0)->iwx_tvqm_enable_txq(
-                    request->sc, request->tid, request->ssn, request->size);
+                    request->sc, request->tid, request->ssn, request->size, request->new_sta_mask);
             }, this, &request);
     }
     if (dmaDetaching || !size || size > IWX_MIN_256_BA_QUEUE_SIZE_GEN3 || (size & (size - 1)))
@@ -3558,10 +3559,17 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
         .sta_id = IWX_STATION_ID,
         .tid = (uint8_t)tid,
     };
+    /* v2.8.4: the new-API queue config (owly's shape, DATA_PATH_GROUP
+     * opcode 0x17). Built below from the ring's DMA addresses, used
+     * when new_sta_mask != 0. */
+    struct iwx_scd_queue_cfg_cmd_add ncmd;
+    memset(&ncmd, 0, sizeof(ncmd));
     struct iwx_rx_packet *pkt;
     struct iwx_tx_queue_cfg_rsp *resp;
     struct iwx_host_cmd hcmd = {
-        .id = IWX_SCD_QUEUE_CFG,
+        .id = new_sta_mask
+            ? iwx_cmd_id(IWX_SCD_QUEUE_CONFIG_CMD, IWX_DATA_PATH_GROUP, 0)
+            : (uint32_t)IWX_SCD_QUEUE_CFG,
         .flags = IWX_CMD_WANT_RESP,
         .resp_pkt_len = sizeof(*pkt) + sizeof(*resp),
     };
@@ -3626,8 +3634,22 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
     cmd.byte_cnt_addr = htole64(ring->bc_tbl.paddr);
     cmd.tfdq_addr = htole64(ring->desc_dma.paddr);
 
-    hcmd.data[0] = &cmd;
-    hcmd.len[0] = sizeof(cmd);
+    if (new_sta_mask) {
+        /* v2.8.4: the new-API ADD, owly's shape. Same DMA addresses,
+         * a station MASK instead of a sta_id, and an operation word. */
+        ncmd.operation = htole32(IWX_SCD_QUEUE_ADD);
+        ncmd.sta_mask = htole32(new_sta_mask);
+        ncmd.tid = (uint8_t)tid;
+        ncmd.flags = 0;
+        ncmd.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(ring->ring_count));
+        ncmd.bc_dram_addr = htole64(ring->bc_tbl.paddr);
+        ncmd.tfdq_dram_addr = htole64(ring->desc_dma.paddr);
+        hcmd.data[0] = &ncmd;
+        hcmd.len[0] = sizeof(ncmd);
+    } else {
+        hcmd.data[0] = &cmd;
+        hcmd.len[0] = sizeof(cmd);
+    }
 
 #ifdef AIRPORT_VTD
     submitted = true;
@@ -7574,6 +7596,18 @@ awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type, int *tid)
         *sta_type = IWX_STA_GENERAL_PURPOSE;
         *tid = IWX_MAX_TID_COUNT;
         break;
+    case 9:
+        /* v2.8.4: binding 7's station (sta 0 LINK) but the inject
+         * queue is allocated with the NEW SCD_QUEUE_CONFIG_CMD
+         * (DATA_PATH_GROUP 0x17), the command owly/iwlwifi actually
+         * uses on this firmware -- the field trace (2026-10-24) showed
+         * owly injects on a queue allocated that way (queue 0x1c),
+         * while itlwm uses the legacy SCD_QUEUE_CFG (0x1d). First test
+         * of the new-API queue path, legacy station kept. */
+        *sta_id = IWX_STATION_ID;
+        *sta_type = IWX_STA_LINK;
+        *tid = IWX_MAX_TID_COUNT;
+        break;
     case 8:
         /* v2.8.3: binding 7 (sta 0 LINK, TVQM queue) + a TLC
          * rate-scaling config for the station (iwx_rs_init), the one
@@ -10013,11 +10047,13 @@ iwx_auth(struct iwx_softc *sc)
          * station (awdl_tx_sta_shape). */
         int sid, stype, stid;
         awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype, &stid);
-        if (sc->sc_awdl_tx_sta == 7 || sc->sc_awdl_tx_sta == 8) {
+        if (sc->sc_awdl_tx_sta == 7 || sc->sc_awdl_tx_sta == 8 ||
+            sc->sc_awdl_tx_sta == 9) {
+            uint32_t nmask = (sc->sc_awdl_tx_sta == 9) ? (1u << sid) : 0;
             /* v2.8.2: let the fw allocate the queue (TVQM), the gen3
              * way, instead of the static fixed qid 2. The returned qid
              * is stored for the inject/completion paths. */
-            int q = iwx_tvqm_alloc_txq(sc, stid, 0);
+            int q = iwx_tvqm_alloc_txq(sc, stid, 0, nmask);
             if (q < 0) {
                 XYLog("itlawdl: TVQM inject queue alloc failed (%d)\n", q);
                 err = EIO;

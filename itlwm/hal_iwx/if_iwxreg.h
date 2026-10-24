@@ -1855,6 +1855,34 @@ struct iwx_tx_queue_cfg_rsp {
     uint16_t reserved;
 } __packed; /* TX_QUEUE_CFG_RSP_API_S_VER_2 */
 
+/*
+ * itlawdl v2.8.4: the NEW scheduler-queue config command, the one
+ * owly/iwlwifi uses on this firmware (field-traced 2026-10-24: owly
+ * injects on queue 0x1c, allocated via DATA_PATH_GROUP opcode 0x17)
+ * instead of the legacy IWX_SCD_QUEUE_CFG (0x1d). Taken from
+ * iwl_scd_queue_cfg_cmd (Linux commit 227f25972c5a, Johannes Berg):
+ * an operation (ADD/REMOVE/MODIFY) then a union. We only build ADD.
+ * Key difference: a station MASK (BIT(sta_id)), not a sta_id. Response
+ * is the same iwx_tx_queue_cfg_rsp.
+ */
+#define IWX_SCD_QUEUE_CONFIG_CMD    0x17    /* in IWX_DATA_PATH_GROUP */
+
+#define IWX_SCD_QUEUE_ADD       0
+#define IWX_SCD_QUEUE_REMOVE    1
+#define IWX_SCD_QUEUE_MODIFY    2
+
+/* The ADD arm of iwl_scd_queue_cfg_cmd's union, flattened. */
+struct iwx_scd_queue_cfg_cmd_add {
+    uint32_t operation;        /* IWX_SCD_QUEUE_ADD */
+    uint32_t sta_mask;         /* BIT(sta_id) */
+    uint8_t tid;
+    uint8_t reserved[3];
+    uint32_t flags;
+    uint32_t cb_size;
+    uint64_t bc_dram_addr;     /* byte-count table */
+    uint64_t tfdq_dram_addr;   /* TFD ring */
+} __packed; /* SCD_QUEUE_CONFIG_CMD_API_S_VER_3, ADD */
+
 
 /*
  * Commands

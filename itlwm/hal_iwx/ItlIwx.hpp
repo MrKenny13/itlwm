@@ -295,8 +295,8 @@ public:
     int    iwx_nic_rx_init(struct iwx_softc *);
     int    iwx_nic_init(struct iwx_softc *);
     int    iwx_enable_txq(struct iwx_softc *, int, int, int, int);
-    int     iwx_tvqm_alloc_txq(struct iwx_softc *, int, int);
-    int     iwx_tvqm_enable_txq(struct iwx_softc *, int, int, uint32_t);
+    int     iwx_tvqm_alloc_txq(struct iwx_softc *, int, int, uint32_t new_sta_mask = 0);
+    int     iwx_tvqm_enable_txq(struct iwx_softc *, int, int, uint32_t, uint32_t new_sta_mask = 0);
     void    iwx_post_alive(struct iwx_softc *);
     int iwx_send_time_event_cmd(struct iwx_softc *sc,
                             const struct iwx_time_event_cmd *cmd);
