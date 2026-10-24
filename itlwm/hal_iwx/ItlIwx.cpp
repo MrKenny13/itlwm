@@ -7502,7 +7502,21 @@ iwx_disable_beacon_filter(struct iwx_softc *sc)
  * died at the very first TFD. Meanwhile the SAME queue number bound
  * to sta 0 carried the boot-time traffic (243 completions) on this
  * very card, which is what binding 1 repeats inside the cell. Binding
- * 2 is iwlwifi's monitor-injection shape (aux-activity station). */
+ * 2 is iwlwifi's monitor-injection shape (aux-activity station).
+ * v2.7.2 adds binding 3, off the v10 run's verdict: bindings 0/1/2
+ * all killed the UMAC (0x71 on the first dump), and the v10 log
+ * cleared everything else -- the rate word (txrate=0x4102, valid),
+ * the TFD (a byte-faithful copy of iwx_tx), and the queue (2 =
+ * IWX_QID_MGMT, the one the boot traffic completed 219 frames
+ * through, binding 1's exact shape, dead on frame #1 in the cell).
+ * What the fw never had is a station typed for broadcast: iwlwifi
+ * gives every vif an IWL_STA_MULTICAST one (fw-api commit ced19f26:
+ * "broadcast station is identified by its type and not the mac
+ * address"), and itlwm never creates one -- its broadcast frames
+ * ride a LINK-typed station, which a BSS context tolerates and a
+ * PIBSS one does not. Binding 3 is binding 1 with only the station's
+ * type (and address, the broadcast) changed: same sta 0, same queue
+ * 2, same tid 15 -- the single-variable experiment. */
 static void
 awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type)
 {
@@ -7514,6 +7528,11 @@ awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type)
     case 2:
         *sta_id = IWX_AUX_STA_ID;
         *sta_type = IWX_STA_AUX_ACTIVITY;
+        break;
+    case 3:
+        /* v2.7.2: the mcast shape -- see the block comment above. */
+        *sta_id = IWX_STATION_ID;
+        *sta_type = IWX_STA_MULTICAST;
         break;
     default:
         *sta_id = IWX_MONITOR_STA_ID;
@@ -7558,6 +7577,12 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
             /* v2.5's shape: a zero address */
             IEEE80211_ADDR_COPY(&add_sta_cmd.addr,
                                 etheranyaddr);
+        else if (ic->ic_opmode == IEEE80211_M_MONITOR &&
+                 sc->sc_awdl_tx_sta == 3)
+            /* v2.7.2: binding 3 is the mcast station, and a mcast
+             * station carries the broadcast, the way iwlwifi's do. */
+            IEEE80211_ADDR_COPY(&add_sta_cmd.addr,
+                                etherbroadcastaddr);
         else if (ic->ic_opmode == IEEE80211_M_MONITOR)
             /* v2.6: our own address, like iwlwifi's aux station and
              * the STA-mode station carry */
@@ -11410,6 +11435,22 @@ iwx_nic_umac_error(struct iwx_softc *sc)
     XYLog("%s: 0x%08X | last host cmd\n", DEVNAME(sc), table.cmd_header);
     XYLog("%s: 0x%08X | isr status reg\n", DEVNAME(sc),
           table.nic_isr_pref);
+
+    /* v2.7.2: the UMAC table is the half that matters -- the UMAC owns
+     * the stations and queues, and the runs' first dump said
+     * NMI_INTERRUPT_UMAC_FATAL off this very table. Its data1-3 name
+     * the assert's objects; until now they only went to kprintf, which
+     * a field log never reads (the fw-crash.txt extraction came back
+     * empty). Capture them beside the LMAC half, first dump of the
+     * session only, same rule as iwx_nic_error's. */
+    if (gAwdl.fw_err == 1) {
+        gAwdl.fw_err_u_id = table.error_id;
+        gAwdl.fw_err_u_il1 = table.ilink1;
+        gAwdl.fw_err_u_d1 = table.data1;
+        gAwdl.fw_err_u_d2 = table.data2;
+        gAwdl.fw_err_u_d3 = table.data3;
+        gAwdl.fw_err_u_ch = table.cmd_header;
+    }
 }
 
 #define IWX_FW_SYSASSERT_CPU_MASK 0xf0000000
@@ -11493,10 +11534,18 @@ iwx_nic_error(struct iwx_softc *sc)
      * already in the stats; the error id (which assert) and the
      * interrupt link (where) now ride along, so a field log says what
      * the firmware choked on without hunting the system log. hcmd is
-     * the command word it was executing. */
-    gAwdl.fw_err_id = table.error_id;
-    gAwdl.fw_err_il1 = table.ilink1;
-    gAwdl.fw_err_hcmd = table.hcmd;
+     * the command word it was executing.
+     * v2.7.2: keep the FIRST dump's identity, not the last. The v09
+     * run's first dump said fwid=0x71 (NMI_INTERRUPT_UMAC_FATAL, the
+     * assert that killed it); every later dump said 0x103d
+     * (ADVANCED_SYSASSERT, the corpse's table) -- the last one is the
+     * one a stats reader saw. The counters reset with the session, so
+     * fw_err==1 here means this is that session's first. */
+    if (gAwdl.fw_err == 1) {
+        gAwdl.fw_err_id = table.error_id;
+        gAwdl.fw_err_il1 = table.ilink1;
+        gAwdl.fw_err_hcmd = table.hcmd;
+    }
 
     if (ERROR_START_OFFSET <= table.valid * ERROR_ELEM_SIZE) {
         XYLog("%s: Start Error Log Dump:\n", DEVNAME(sc));
@@ -14239,6 +14288,7 @@ awdlSessionSetGated(int target, int cell_wanted)
         awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype);
         gAwdl.tx_sta = sc->sc_awdl_tx_sta;
         gAwdl.tx_sta_id = sid;
+        gAwdl.tx_sta_type = stype;
         gAwdl.tx_tid = IWX_MGMT_TID;
     }
     XYLog("itlawdl: %s session up (channel %d, fw mac type %d, inject sta %d)\n",

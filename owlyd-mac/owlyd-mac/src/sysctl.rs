@@ -185,6 +185,69 @@ pub fn radio_fw_err() -> Option<u64> {
     None
 }
 
+/// A firmware error dump's numbers, off the kext's stats (v2.7.2+
+/// kexts): the session's FIRST dump — the assert that killed it, not
+/// the corpse's later ones. The LMAC half (fwid=, il1=, hcmd=) and the
+/// UMAC half (umac id=/il=/d1=/d2=/d3=/ch=): the UMAC owns the
+/// stations and queues, its data1-3 name what it choked on. A kext
+/// too old to say them reads back as all zeros; `None` when the stats
+/// carry no dump identity at all.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FwDump {
+    pub fwid: u32,
+    pub il1: u32,
+    pub hcmd: u32,
+    pub u_id: u32,
+    pub u_il1: u32,
+    pub u_d1: u32,
+    pub u_d2: u32,
+    pub u_d3: u32,
+    pub u_ch: u32,
+}
+
+fn hex_u32(v: &str) -> Option<u32> {
+    let h = v
+        .strip_prefix("0x")
+        .or_else(|| v.strip_prefix("0X"))
+        .unwrap_or(v);
+    u32::from_str_radix(h, 16).ok()
+}
+
+/// The last error dump's identity, as the stats name it.
+pub fn radio_fw_dump() -> Option<FwDump> {
+    let s = read_string("debug.itlawdl_stats").ok()?;
+    let mut d = FwDump::default();
+    let mut any = false;
+    for l in s.lines() {
+        for w in l.split_whitespace() {
+            if let Some((k, v)) = w.split_once('=') {
+                if let Some(n) = hex_u32(v) {
+                    match k {
+                        "fwid" => {
+                            d.fwid = n;
+                            any = true;
+                        }
+                        "il1" => d.il1 = n,
+                        "hcmd" => d.hcmd = n,
+                        // the umac line: id=/il=/d1=/d2=/d3=/ch=
+                        "id" => {
+                            d.u_id = n;
+                            any = true;
+                        }
+                        "il" => d.u_il1 = n,
+                        "d1" => d.u_d1 = n,
+                        "d2" => d.u_d2 = n,
+                        "d3" => d.u_d3 = n,
+                        "ch" => d.u_ch = n,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    any.then_some(d)
+}
+
 /// The session sysctl's states, as the kext reads them back.
 pub mod state {
     pub const OFF: i32 = 0;

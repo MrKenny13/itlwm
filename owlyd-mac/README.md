@@ -137,6 +137,21 @@ nothing watched the firmware anymore (an error dump there now falls
 back to the last proven pace, and the monitor's line carries rx, and
 fw_err at every boundary).
 
+v0.2.1 rides the v10 run's verdict. The binding-2 test (aux station)
+cleared the last two suspects — txrate was valid and the first frame
+finally survived the firmware — but the UMAC still died within ten,
+rx frozen. What the firmware never had is a station typed for
+broadcast: iwlwifi gives every vif an IWL_STA_MULTICAST one and itlwm
+never creates one. The kext's v2.7.2 adds binding 3
+(`sysctl -w debug.itlawdl_txsta=3`: station 0 typed MULTICAST,
+address ff:ff:ff:ff:ff:ff, queue and tid untouched — the single-
+variable experiment against binding 1), feeds the error dump's UMAC
+table into the stats (`umac id=… il=… d1=… d2=… d3=… ch=…`, kept from
+the session's first dump — the one that killed it), and names the
+station's type in the txsta line. The daemon's side: the crash message
+prints the actual values (it said "fwid=/il1=/hcmd=" since v0.2.0
+shipped it as a literal), and parses the UMAC half to say it.
+
 ## Credits
 
 - [owly](https://github.com/t4t5/owly) (MIT): the AWDL engine — sync,

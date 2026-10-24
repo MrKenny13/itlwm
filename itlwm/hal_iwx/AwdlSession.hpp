@@ -59,6 +59,20 @@
 //  now -- a tool writing between sessions injected against a dead
 //  queue.
 //
+//  v2.7.2: the v10 run (binding 2, aux) cleared the last two suspects
+//  -- the rate word was valid and the first frame finally survived --
+//  but the UMAC still died within ten. What the firmware never had is
+//  a station typed for broadcast: iwlwifi gives every vif an
+//  IWL_STA_MULTICAST one, and itlwm never creates one. Binding 3
+//  (debug.itlawdl_txsta=3) is binding 1 with only the station's type
+//  changed to MULTICAST (address ff:ff:ff:ff:ff:ff) -- same sta 0,
+//  same queue 2, same tid 15. And the error dump's UMAC table now
+//  rides in the stats (umac id=/il=/d1=/d2=/d3=/ch=) beside the LMAC
+//  half, kept from the session's FIRST dump (the assert that killed
+//  it; later dumps are the corpse's), so the next field log names the
+//  UMAC's own numbers without hunting kprintf output the field never
+//  reads.
+//
 //  With Wi-Fi turned OFF in macOS, `sysctl -w debug.itlawdl=2` restarts
 //  the firmware as a "cell" on channel 6: a PIBSS MAC context (Intel's
 //  pseudo-IBSS; a plain IBSS one receives nothing on this firmware) on
@@ -76,7 +90,9 @@
 //                                  4 ibss, 3 pibss, 2 listener
 //    debug.itlawdl_txsta  int rw   inject queue binding: 0 monitor
 //                                  (v2.5), 1 sta0 LINK (default), 2
-//                                  aux -- read at session start
+//                                  aux, 3 sta0 MULTICAST (v2.7.2,
+//                                  iwlwifi's bcast shape) -- read at
+//                                  session start
 //    debug.itlawdl_stats  string   counters
 //    debug.itlawdl_rx     opaque   drains received frames: 16-byte
 //                                  header (u16 len, u8 rate, i8 rssi,
@@ -150,15 +166,26 @@ struct awdl_session_state {
     uint32_t inject_rate_nf;
     uint64_t fw_err;
     /* v2.7: the last error dump's identity -- which assert (fwid=),
-     * where (il1=), executing which command word (hcmd=). */
+     * where (il1=), executing which command word (hcmd=). v2.7.2: kept
+     * from the session's FIRST dump (the one that killed it; later
+     * ones are the corpse's -- v10's later dumps all said 0x103d while
+     * the first said 0x71, the UMAC fatal). */
     uint32_t fw_err_id, fw_err_il1, fw_err_hcmd;
+    /* v2.7.2: the same dump's UMAC table -- the UMAC owns the stations
+     * and queues, and its data1-3 name the assert's objects. They went
+     * to kprintf only before, which a field log never reads. */
+    uint32_t fw_err_u_id, fw_err_u_il1, fw_err_u_d1, fw_err_u_d2,
+              fw_err_u_d3, fw_err_u_ch;
 
     /* v2.6: the binding this session's inject queue came up on
      * (tx_sta = debug.itlawdl_txsta's value at session start;
      * tx_sta_id/tx_tid the resolved queue mapping). Written at
-     * session start like cell/channel, not reset. */
+     * session start like cell/channel, not reset. v2.7.2: tx_sta_type
+     * joins them -- the station's TYPE is the binding's whole point,
+     * and the stats line names it. */
     int tx_sta_wanted;
     int tx_sta, tx_sta_id, tx_tid;
+    int tx_sta_type;
 
     /* rx ring: length-prefixed records, drained by debug.itlawdl_rx */
     uint8_t *ring;
@@ -233,6 +260,21 @@ awdl_session_reset_counters(void)
 
 /* ---- sysctl handlers ---- */
 
+/* v2.7.2: the station's type, by name, for the stats line -- "link",
+ * "gp", "mcast", "tdls", "aux": the binding's whole point, visible. */
+static const char *
+awdl_sta_type_name(int t)
+{
+    switch (t) {
+    case IWX_STA_LINK: return "link";
+    case IWX_STA_GENERAL_PURPOSE: return "gp";
+    case IWX_STA_MULTICAST: return "mcast";
+    case IWX_STA_TDLS_LINK: return "tdls";
+    case IWX_STA_AUX_ACTIVITY: return "aux";
+    default: return "?";
+    }
+}
+
 static void
 awdl_session_work(thread_call_param_t, thread_call_param_t)
 {
@@ -284,7 +326,7 @@ awdl_txsta_sysctl SYSCTL_HANDLER_ARGS
     int err = sysctl_handle_int(oidp, &v, 0, req);
     if (err || !req->newptr)
         return err;
-    if (v < 0 || v > 2)
+    if (v < 0 || v > 3)
         return EINVAL;
     /* takes effect at the next session start; the stats line says
      * which binding is live (txsta=). */
@@ -295,7 +337,7 @@ awdl_txsta_sysctl SYSCTL_HANDLER_ARGS
 static int
 awdl_stats_sysctl SYSCTL_HANDLER_ARGS
 {
-    static char buf[640];
+    static char buf[768];
     int n;
 
     n = snprintf(buf, sizeof(buf),
@@ -303,7 +345,8 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         "awdl action=%llu psf=%llu mif=%llu other=%llu data=%llu data_bytes=%llu\n"
         "peer %02x:%02x:%02x:%02x:%02x:%02x rssi=%d\n"
         "inject ok=%llu err=%llu bytes=%llu done=%llu recycled=%llu done_err=%llu last=0x%x txrate=0x%x\n"
-        "fw_err=%llu fwid=0x%x il1=0x%x hcmd=0x%x txsta=%d(sta %d tid %d want %d)\n"
+        "fw_err=%llu fwid=0x%x il1=0x%x hcmd=0x%x txsta=%d(sta %d type %s tid %d want %d)\n"
+        "umac id=0x%x il=0x%x d1=0x%x d2=0x%x d3=0x%x ch=0x%x\n"
         "state=%d cell=%d(want %d) channel=%d\n",
         gAwdl.rx, gAwdl.rx_bytes, gAwdl.rx_dropped, gAwdl.dup,
         gAwdl.action, gAwdl.psf, gAwdl.mif, gAwdl.other_action,
@@ -317,8 +360,12 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         (unsigned)gAwdl.inject_rate_nf,
         gAwdl.fw_err, (unsigned)gAwdl.fw_err_id,
         (unsigned)gAwdl.fw_err_il1, (unsigned)gAwdl.fw_err_hcmd,
-        gAwdl.tx_sta, gAwdl.tx_sta_id, gAwdl.tx_tid,
-        gAwdl.tx_sta_wanted,
+        gAwdl.tx_sta, gAwdl.tx_sta_id,
+        awdl_sta_type_name(gAwdl.tx_sta_type),
+        gAwdl.tx_tid, gAwdl.tx_sta_wanted,
+        (unsigned)gAwdl.fw_err_u_id, (unsigned)gAwdl.fw_err_u_il1,
+        (unsigned)gAwdl.fw_err_u_d1, (unsigned)gAwdl.fw_err_u_d2,
+        (unsigned)gAwdl.fw_err_u_d3, (unsigned)gAwdl.fw_err_u_ch,
         gAwdl.session, gAwdl.cell, gAwdl.cell_wanted, gAwdl.channel);
     if (n < 0)
         return EIO;
@@ -417,7 +464,7 @@ SYSCTL_PROC(_debug, OID_AUTO, itlawdl_cell, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_L
             "pin fw mac type for the next session: 0 auto (pibss), 4 ibss, 3 pibss, 2 listener");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_txsta, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_txsta_sysctl, "I",
-            "inject queue station binding: 0 monitor (v2.5), 1 sta0 link (default), 2 aux -- read at session start");
+            "inject queue station binding: 0 monitor (v2.5), 1 sta0 LINK (default), 2 aux, 3 sta0 mcast (v2.7.2) -- read at session start");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_stats_sysctl, "A",
             "itlwm AWDL session counters");

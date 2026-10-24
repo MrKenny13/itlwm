@@ -271,14 +271,29 @@ impl Gate {
             } else {
                 0
             };
-            let why = "le firmware a planté (dump d'erreur : fwid=/il1=/hcmd= dans les stats)";
-            l.held = Some((back, why.into()));
+            // v0.2.1: the values, not the placeholders — the message
+            // has said "fwid=/il1=/hcmd=" since v0.2.0 shipped it as a
+            // literal. The UMAC half joins in (v2.7.2 kexts): it owns
+            // the stations and queues, and its data1-3 name the
+            // assert's objects.
+            let dump = sysctl::radio_fw_dump();
+            let why = match &dump {
+                Some(d) => format!(
+                    "le firmware a planté (dump d'erreur : fwid=0x{:x} il1=0x{:x} \
+                     hcmd=0x{:x} | umac id=0x{:x} il=0x{:x} d1=0x{:x} d2=0x{:x} \
+                     d3=0x{:x} ch=0x{:x} — dans les stats)",
+                    d.fwid, d.il1, d.hcmd, d.u_id, d.u_il1, d.u_d1, d.u_d2, d.u_d3, d.u_ch
+                ),
+                None => "le firmware a planté (dump d'erreur : voir les stats)".to_string(),
+            };
+            l.held = Some((back, why.clone()));
             if back == 0 {
                 l.state = "émission coupée (plantage firmware)".into();
                 let pace = ceiling_limit(l);
                 println!(
                     "== porte TX : {why} dès {pace} — j'arrête d'émettre pour cette \
-                     session ; colle-moi ce log : les stats nomment l'assert (fwid=, il1=, hcmd=)"
+                     session ; colle-moi ce log : les stats nomment l'assert \
+                     (fwid=, umac id=, d1-d3=)"
                 );
             } else {
                 l.state = format!("tenue à {back} tr/s (plantage firmware en rythme libre)");
