@@ -120,3 +120,64 @@ sous-système, pas un binding.
 - owly (t4t5/owly, MIT) — fait l'injection sur Linux avec iwlwifi.
 - Linux commit 227f25972c5a (Johannes Berg) — `iwl_scd_queue_cfg_cmd`.
 - Trace terrain : `awdl-trace.txt` (owly test-card, AX211, 2026-10-24).
+
+---
+
+## Recette exacte d'owly (octets capturés 2026-10-24, bpftrace sur iwlwifi_dev_hcmd)
+
+Chaîne d'injection owly (nouvelle API iwlmld). Substituer notre MAC à
+`40:d1:33:7a:3e:d3`, nos adresses DMA à celles de la file. Le BSSID AWDL
+`00:25:00:ff:94:73` est déjà celui qu'on veut.
+
+### MAC_CONFIG_CMD (0x03.0x08), len 52 — contexte d'injection
+```
+id_and_color=0  action=ADD(1)/MODIFY(2)  mac_type=4
+local_mld_addr=<NOTRE MAC>  filter_flags=0x2c
+he_support=0 he_ap=0 eht=0  nic_not_ack_enabled=1  union=0
+```
+Champs (le32 sauf addr) : id_color@0, action@4, mac_type@8,
+local_mld_addr[6]@12 +rsv[2]@18, filter_flags@20, he_support(16)@24,
+he_ap_support(16)@26, eht_support@28, nic_not_ack@32, union[16]@36.
+
+### LINK_CONFIG_CMD (0x03.0x09), len 208 — lien d'injection
+```
+action=MODIFY(2)  link_id=0  mac_id=0  phy_id=0
+local_link_addr=<NOTRE MAC>  modify_mask=3  active=1
+cck_rates=0x0f  ofdm_rates=0x15  protection_flags=6  qos_flags=3
+ac[0]=cwmin0x0f cwmax0x3ff aifsn7 fifo2 txop0
+ac[1]=cwmin0x0f cwmax0x3ff aifsn3 fifo4 txop0
+ac[2]=cwmin0x07 cwmax0x0f aifsn2 fifo8 txop0x0bc0
+ac[3]=cwmin0x03 cwmax0x07 aifsn2 fifo16 txop0x05e0
+ac[4]=0
+bi=10000(0x2710)@136  bssid 00:25:00:ff:94:73 @168
+```
+Offsets : action@0 link_id@4 mac_id@8 phy_id@12 addr[6]@16+rsv@22,
+modify_mask@24 active@28 union@32 cck_rates@36 ofdm_rates@40
+cck_short_pre@44 short_slot@48 protection_flags@52 qos_flags@56
+ac[5]@60 (8o chacun) … bi@136 dtim@140 … bssid[6]@168.
+
+### STA_CONFIG_CMD (0x03.0x0a), len 96 — station d'injection
+```
+sta_id=2  link_id=0  peer_mld=00:25:00:ff:94:73  peer_link=00:25:00:ff:94:73
+station_type=1 (BCAST_MGMT)  assoc_id=0  beamform=0  mfp=1  reste=0
+```
+Offsets : sta_id@0 link_id@4 peer_mld[6]@8+rsv@14 peer_link[6]@16+rsv@22
+station_type@24 assoc_id@28 beamform@32 mfp@36 mimo@40 …
+
+### SCD_QUEUE_CONFIG_CMD (0x05.0x17), len 36 — file d'injection
+```
+operation=ADD(0)  sta_mask=BIT(2)=4  tid=15  flags=0  cb_size=4
+bc_dram_addr=<notre bc_tbl>  tfdq_dram_addr=<notre desc_dma>
+```
+(La struct iwx_scd_queue_cfg_cmd_add du binding 9 est déjà bonne.)
+
+### Ordre owly
+MAC_CONFIG(ADD) → LINK_CONFIG(ADD) → LINK_CONFIG(MODIFY active=1) →
+STA_CONFIG(bcast_mgmt) → SCD_QUEUE_CONFIG(ADD). Puis l'injection sort sur
+la file rendue (owly : queue 0x1c=28). TLC (0x05.0x0f) en plus pour les
+stations peer, pas nécessaire pour l'injection bcast_mgmt a priori.
+
+### Inconnue à valider
+phy_id=0 : suppose que le contexte PHY existant d'itlwm (phy_ctxt[0],
+IWX_PHY_CONTEXT_CMD) est compatible. Si assert sur phy, c'est le premier
+point à corriger (passer le PHY à la nouvelle API aussi).
