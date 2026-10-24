@@ -181,3 +181,41 @@ stations peer, pas nécessaire pour l'injection bcast_mgmt a priori.
 phy_id=0 : suppose que le contexte PHY existant d'itlwm (phy_ctxt[0],
 IWX_PHY_CONTEXT_CMD) est compatible. Si assert sur phy, c'est le premier
 point à corriger (passer le PHY à la nouvelle API aussi).
+
+---
+
+## v2.8.5 / v2.8.6 — commandes acceptées, mais contexte non activé
+
+Le chemin nouvelle API complet (binding 10, iwx_awdl_mld_inject_setup)
+envoie MAC_CONFIG → LINK_CONFIG(ADD+MODIFY active) → STA_CONFIG(bcast_mgmt)
+→ SCD_QUEUE. Résultats terrain :
+
+- **Aucun plantage au setup** : les 4 commandes sont acceptées (grand
+  pas — fini les asserts qui nomment nos commandes au setup).
+- **rx=0** : le contexte ne reçoit rien, même après LINK MODIFY active=1.
+- **Assert à l'émission** : fw_err monte dès la 1re trame, `umac d1=0x8
+  d2=0x3` = MAC_CONFIG (0x3.0x8). Le firmware trouve le contexte
+  incomplet quand la TX l'utilise. La file rendue par TVQM = qid 2 (owly
+  obtenait 28), signe d'un contexte pas pleinement actif.
+
+### Cause : il manque tout le rituel de bring-up MLD
+
+La capture montre qu'owly fait ~100 commandes interdépendantes AVANT que
+le contexte d'injection soit actif, pas seulement les 4 de la chaîne :
+commandes système (2.0f), base PHY (1.a9, 1.d2), data-path (5.16, 5.02,
+5.0f TLC, 5.08 RLC), per-chain TX power (4.04, 4.05), un BEACON_TEMPLATE
+(1.91), et plusieurs MAC/LINK MODIFY. Reproduire seulement MAC/LINK/STA/
+QUEUE fait accepter les commandes mais n'active pas le contexte.
+
+Séquence owly autour de l'injection (fin des 100 premières) :
+`… 1.08 5.08 1.91 3.09 3.0a 5.17 3.0a 5.17 3.09 1.91`
+(RLC, beacon, LINK, STA mcast, queue, STA bcast_mgmt, queue, LINK, beacon)
+
+### Conclusion
+
+Le correctif complet = porter le **bring-up MLD** d'iwlmld (pas juste 4
+commandes) : la config système/PHY-DB/data-path nouvelle API, le beacon
+template, et l'ordre exact. C'est un vrai portage de sous-système, à
+faire posément (idéalement avec la source iwlmld + les octets déjà
+capturés dans hcmd-bytes). Tous les octets des commandes individuelles
+sont connus (capture 2026-10-24) ; ce qui reste, c'est l'orchestration.
