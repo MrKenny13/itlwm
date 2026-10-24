@@ -50,6 +50,15 @@
 //  anything still wedges, the next log names the assert without the
 //  system log.
 //
+//  v2.7.1: two audit fixes. (1) The stats buffer: a truncated
+//  snprintf returns the would-be length (>= sizeof(buf)), which
+//  sysctl_handle_string would take as the buffer's size -- reading (and
+//  on some XNU paths writing) past it. The length is clamped to the
+//  buffer now. (2) awdlInject demands a live session: the ring_count
+//  alone said the queue was allocated once, not that a session owns it
+//  now -- a tool writing between sessions injected against a dead
+//  queue.
+//
 //  With Wi-Fi turned OFF in macOS, `sysctl -w debug.itlawdl=2` restarts
 //  the firmware as a "cell" on channel 6: a PIBSS MAC context (Intel's
 //  pseudo-IBSS; a plain IBSS one receives nothing on this firmware) on
@@ -313,6 +322,12 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         gAwdl.session, gAwdl.cell, gAwdl.cell_wanted, gAwdl.channel);
     if (n < 0)
         return EIO;
+    /* v2.7.1: a truncated snprintf returns the would-be length, which
+     * would walk sysctl_handle_string past buf (XNU reads -- and on
+     * some paths writes -- arg1[arg2-1]). The string is NUL-terminated
+     * at buf[sizeof(buf)-1] either way; hand it no more than that. */
+    if (n >= (int)sizeof(buf))
+        n = (int)sizeof(buf) - 1;
     return sysctl_handle_string(oidp, buf, n + 1, req);
 }
 

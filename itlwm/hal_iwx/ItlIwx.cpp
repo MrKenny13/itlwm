@@ -14323,6 +14323,17 @@ awdlInject(const uint8_t *req, size_t reqlen)
         gAwdl.inject_err++;
         return ENODEV;    /* no session, or the queue never came up */
     }
+    /* v2.7.1: and a live session, not just an allocated queue. The
+     * ring_count outlives the session that enabled it (the rings are
+     * allocated at attach), so a tool writing between sessions -- or
+     * after a failure -- would inject against a queue whose station
+     * went down with the session: counted by nobody, completed by
+     * nothing, and a fine way to wedge counters that read confusing
+     * ever after. */
+    if (!gAwdl.session) {
+        gAwdl.inject_err++;
+        return ENXIO;
+    }
 
     if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || m == NULL)
         return ENOMEM;

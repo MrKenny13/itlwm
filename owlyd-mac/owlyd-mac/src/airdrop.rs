@@ -20,22 +20,25 @@
 //! v0.1.6, one lane more: the v06 field run proved macOS never routed a
 //! single multicast packet into the utun ("0 paquets lus au total" while
 //! ~1700 announcements left the socket, every send's error thrown away).
-//! The socket stays — queries arrive on it and answers leave on it, and
-//! its send errors are said out loud now — but the announcements also
-//! ride the loop-in lane: the same bursts, pushed straight into the
-//! engine's netif channel, as if the kernel had routed them. A phone that
-//! receives both copies has merely one announcement more of the 64 each
-//! burst sends anyway.
+//! v0.2.0 widens the lesson: it was not just the announcements — every
+//! REPLY to a phone's mDNS query rode that same dead socket, so a
+//! browsing iPhone was left to catch an unsolicited burst on its own.
+//! All of the responder's egress — announcements, replies, goodbyes —
+//! rides the outbox lane now (owly-airdrop's third documented
+//! deviation): the daemon wraps each message in the IPv6+UDP the
+//! engine carries, with its checksum, and pushes it straight into the
+//! engine's netif queue, as if the kernel had routed it. The socket
+//! keeps the receive side (queries arrive on it) and stays ready for
+//! the day the kernel carries sends.
 
 use std::io;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
-use owly_airdrop::driver::mdns::{Mdns, Registration};
+use owly_airdrop::driver::mdns::{Egress, Mdns, Registration};
 use owly_airdrop::driver::receiver::{Options, Receiver, ReceiverEvent};
 use owly_airdrop::driver::tls::{rustls, Identity};
-use owly_airdrop::proto::mdns::{service_id, Announcer, Burst, MDNS_GROUP, MDNS_PORT, Service, RECEIVER_FLAGS};
+use owly_airdrop::proto::mdns::{service_id, Burst, MDNS_PORT, Service, RECEIVER_FLAGS};
 use owly_airdrop::proto::receiver::Config;
 use owly_awdl::Ipv6Packet;
 
@@ -72,7 +75,9 @@ pub struct AirDrop {
 /// Brings the receiver up on the utun: the TLS listener on
 /// `[link-local]:8770`, and the `_airdrop._tcp` records announced in
 /// bursts. `scope` is the utun's interface index; `addr` its link-local
-/// address; `name` what the share sheet will show (the computer name).
+/// address; `name` what the share sheet will show (the computer name);
+/// `host` the engine's netif queue, which every mDNS egress rides — the
+/// lane the kernel refuses to give the socket on this utun.
 pub async fn start(
     scope: u32,
     addr: Ipv6Addr,
@@ -110,39 +115,42 @@ pub async fn start(
         addr,
         flags: RECEIVER_FLAGS,
     };
-    let announce = Mdns::new(scope)
-        .with_burst(Some(ANNOUNCE))
-        .register(service.clone())
-        .await
-        .map_err(|e| io::Error::other(format!("le répondeur mDNS sur l'interface {scope} : {e}")))?;
-
-    // The loop-in lane: the same bursts, straight into the engine — the
-    // ride the kernel refuses to give the socket on this utun (v06: zero
-    // packets ever read off it). The socket keeps its own burst for the
-    // day the kernel carries it; a phone that sees both copies of an
-    // announcement has one more of the 64 a burst sends anyway.
-    let packet = Ipv6Packet::from_ip(ipv6_udp(
-        addr,
-        MDNS_GROUP,
-        MDNS_PORT,
-        MDNS_PORT,
-        &service.announcement(),
-    ))
-    .ok_or_else(|| io::Error::other("l'annonce ne se construit pas (adresse ?)"))?;
+    // The outbox lane: everything the responder sends — announcement
+    // bursts, replies to a phone's queries, the goodbye at the end —
+    // pushed straight into the engine, wrapped in the IPv6+UDP the
+    // kernel never built for us on this utun (v06: zero packets ever
+    // read off it). One lane for all of it: a phone that asks a question
+    // gets its answer the same way one that listens gets its burst.
+    let (outbox_tx, mut outbox_rx) = mpsc::channel::<Egress>(ANNOUNCE.count.min(64) as usize);
+    let host_lane = host;    // the engine's netif queue, moved into the task
+    let lane_addr = addr;
     tokio::spawn(async move {
-        let mut announcer = Announcer::new(Some(ANNOUNCE), Instant::now());
-        while let Some(at) = announcer.next_timer() {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
-            if announcer.on_timer(Instant::now())
-                && host.send(packet.clone()).await.is_err()
-            {
+        while let Some(egress) = outbox_rx.recv().await {
+            let packet = ipv6_udp(
+                lane_addr,
+                *egress.to.ip(),
+                MDNS_PORT,
+                egress.to.port(),
+                &egress.message,
+            );
+            let Some(packet) = Ipv6Packet::from_ip(packet) else {
+                continue; // an address we cannot wrap: not carried
+            };
+            if host_lane.send(packet).await.is_err() {
                 return; // the engine is gone
             }
         }
     });
+    let announce = Mdns::new(scope)
+        .with_burst(Some(ANNOUNCE))
+        .with_outbox(outbox_tx)
+        .register(service.clone())
+        .await
+        .map_err(|e| io::Error::other(format!("le répondeur mDNS sur l'interface {scope} : {e}")))?;
+
     println!(
-        "== annonces _airdrop._tcp : chemin direct vers le moteur ouvert (64 copies par salve, \
-         tous les 3 s)"
+        "== annonces et réponses _airdrop._tcp : chemin direct vers le moteur ouvert \
+         (64 copies par salve, tous les 3 s)"
     );
 
     println!(
@@ -263,7 +271,7 @@ fn chown_tree(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use owly_airdrop::proto::mdns::{Message, Name, RData};
+    use owly_airdrop::proto::mdns::{Message, Name, RData, MDNS_GROUP};
 
     fn service() -> Service {
         Service {

@@ -134,24 +134,55 @@ pub fn radio_rx() -> Option<u64> {
         .ok()
 }
 
-/// The kext's inject counters (ok, err), off its stats.
-pub fn radio_inject() -> Option<(u64, u64)> {
+/// The kext's inject counters, off its stats: `ok` writes taken, `err`
+/// refused, `done` TX completions seen for the inject queue (v2.5+),
+/// `done_err` of them FAILED (v2.6+). Fields the running kext is too
+/// old to say read as 0 — a v2.4 kext reports `done=0` forever, which
+/// the ramp must not read as "never completed".
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct InjectStats {
+    pub ok: u64,
+    pub err: u64,
+    pub done: u64,
+    pub done_err: u64,
+}
+
+/// The kext's inject counters, off its stats.
+pub fn radio_inject() -> Option<InjectStats> {
     let s = read_string("debug.itlawdl_stats").ok()?;
     let l = s.lines().find(|l| l.starts_with("inject"))?;
-    let mut ok = None;
-    let mut err = None;
+    let mut st = InjectStats::default();
     for w in l.split_whitespace() {
         if let Some((k, v)) = w.split_once('=') {
             if let Ok(v) = v.parse::<u64>() {
                 match k {
-                    "ok" => ok = Some(v),
-                    "err" => err = Some(v),
+                    "ok" => st.ok = v,
+                    "err" => st.err = v,
+                    "done" => st.done = v,
+                    "done_err" => st.done_err = v,
                     _ => {}
                 }
             }
         }
     }
-    Some((ok?, err?))
+    Some(st)
+}
+
+/// The kext's firmware-error count (v2.6+): every dump iwx_nic_error
+/// printed — the wedge's signature. `None` when the running kext is
+/// older and does not say (the ramp then judges on rx alone).
+pub fn radio_fw_err() -> Option<u64> {
+    let s = read_string("debug.itlawdl_stats").ok()?;
+    for l in s.lines() {
+        for w in l.split_whitespace() {
+            if let Some(("fw_err", v)) = w.split_once('=') {
+                if let Ok(v) = v.parse::<u64>() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The session sysctl's states, as the kext reads them back.

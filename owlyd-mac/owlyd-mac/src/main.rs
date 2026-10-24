@@ -33,7 +33,7 @@ use netif::UtunSetup;
 use owly_airdrop::driver::receiver::ReceiverEvent;
 use owly_airdrop::proto::messages::Offer;
 use owly_awdl::{Channel, Config, Ipv6Packet, MacAddr, PeerInfo, Presence, RadioConstraints};
-use sysctl::state;
+use sysctl::{state, InjectStats};
 
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, watch};
@@ -193,7 +193,7 @@ async fn monitor(
     let mut airdrop_alive = events.is_some();
     let mut last_peers: Vec<PeerInfo> = Vec::new();
     let mut last_iters: u64 = 0;
-    let mut inject: Option<(u64, u64)> = None;
+    let mut inject: Option<InjectStats> = None;
     let mut warned_inject = false;
     loop {
         tokio::select! {
@@ -235,9 +235,9 @@ async fn monitor(
                     // by every frame the engine builds. Say it once, in
                     // the user's words, instead of a silent dead radio.
                     let now = sysctl::radio_inject();
-                    if let (Some((ok, err)), Some((was_ok, was_err))) = (now, inject) {
-                        if !warned_inject && err > was_err + 100 && ok == was_ok {
-                            println!("— kext : la file d'émission sature (ok={ok}, err={err}) — c'est la limite des ~330 trames des kexts v2.2/v2.3 ; le kext v2.4 la recycle");
+                    if let (Some(now), Some(was)) = (now, inject) {
+                        if !warned_inject && now.err > was.err + 100 && now.ok == was.ok {
+                            println!("— kext : la file d'émission sature (ok={}, err={}) — c'est la limite des ~330 trames des kexts v2.2/v2.3 ; le kext v2.4 la recycle", now.ok, now.err);
                             warned_inject = true;
                         }
                     }

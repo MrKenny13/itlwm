@@ -20,6 +20,24 @@ use crate::proto::mdns::{
 pub struct Mdns {
     scope_id: u32,
     burst: Option<Burst>,
+    /// The host's own lane for packets the kernel refuses to carry off
+    /// this interface. (The macOS port's third deviation from the vendored
+    /// sources: on its utun, not one multicast send off the socket ever
+    /// reached the air -- every egress of the responder, announcements,
+    /// replies and goodbyes alike, rides this instead. The socket keeps
+    /// the receive side; a host that passes `None` sends on it, as
+    /// upstream does.)
+    outbox: Option<mpsc::Sender<Egress>>,
+}
+
+/// One mDNS message on its way out, through the host's lane: the DNS
+/// message, and where it goes.
+#[derive(Debug)]
+pub struct Egress {
+    /// The DNS message, as the socket would have carried it.
+    pub message: Vec<u8>,
+    /// Its destination: the group, or the querier for a unicast reply.
+    pub to: SocketAddrV6,
 }
 
 /// A registered service, withdrawn when dropped.
@@ -38,6 +56,7 @@ impl Mdns {
         Mdns {
             scope_id,
             burst: None,
+            outbox: None,
         }
     }
 
@@ -46,6 +65,13 @@ impl Mdns {
     /// (MDNS-7). The radio's link says which, if any.
     pub fn with_burst(mut self, burst: Option<Burst>) -> Self {
         self.burst = burst;
+        self
+    }
+
+    /// Sends every egress through `outbox` instead of the socket (the
+    /// macOS port's lane -- see [`Mdns`]).
+    pub fn with_outbox(mut self, outbox: mpsc::Sender<Egress>) -> Self {
+        self.outbox = Some(outbox);
         self
     }
 
@@ -127,14 +153,7 @@ impl Mdns {
                 _ = &mut stopped => break,
                 () = sleep(wait.unwrap_or_default()), if wait.is_some() => {
                     if announcer.on_timer(Instant::now()) {
-                        if let Err(e) = socket.send_to(&announcement, group).await {
-                            send_errs += 1;
-                            if send_errs == 1 || send_errs % 128 == 0 {
-                                tracing::warn!(
-                                    "mDNS socket : un envoi vers le groupe a rendu {e} ({send_errs} échecs) — les annonces passent aussi par le chemin direct du démon"
-                                );
-                            }
-                        }
+                        self.egress(&socket, &announcement, group, &mut send_errs).await;
                     }
                 }
                 received = socket.recv_from(&mut buf) => {
@@ -145,17 +164,51 @@ impl Mdns {
                     let to = if reply.unicast { from } else { group };
                     // RFC 6762 §6: a short random delay for shared records
                     // isn't needed with one responder per link.
-                    if let Err(e) = socket.send_to(&reply.message, to).await {
-                        reply_errs += 1;
-                        if reply_errs == 1 {
-                            tracing::warn!("mDNS socket : une réponse a rendu {e}");
-                        }
-                    }
+                    self.egress(&socket, &reply.message, to, &mut reply_errs).await;
                 }
             }
         }
         // Withdraw the records (RFC 6762 §10.1).
-        let _ = socket.send_to(&service.goodbye(), group).await;
+        self.egress(&socket, &service.goodbye(), group, &mut send_errs).await;
+    }
+
+    /// Sends one message: through the outbox when the host gave one (its
+    /// utun never carried a multicast send off the socket), else through
+    /// the socket, as upstream does. (The macOS port's third deviation.)
+    async fn egress(
+        &self,
+        socket: &UdpSocket,
+        message: &[u8],
+        to: SocketAddrV6,
+        errs: &mut u64,
+    ) {
+        if let Some(outbox) = &self.outbox {
+            // The lane dies only with the engine under it; nothing else
+            // is left to try, and the session is ending anyway.
+            if outbox
+                .send(Egress { message: message.to_vec(), to })
+                .await
+                .is_err()
+            {
+                *errs += 1;
+            }
+            return;
+        }
+        // macOS port, v0.1.6: this socket's sends were the v06 field run's
+        // silent failure — ~1700 announcements "sent", not one ever read
+        // off the utun, every error thrown away with `let _`. They are
+        // said out loud now (the first, then every 128th): a send that
+        // never fails means the kernel carries them, one that always does
+        // means only the daemon's direct lane rides.
+        if let Err(e) = socket.send_to(message, to).await {
+            *errs += 1;
+            if *errs == 1 || *errs % 128 == 0 {
+                tracing::warn!(
+                    "mDNS socket : un envoi vers le groupe a rendu {e} ({} échecs)",
+                    *errs
+                );
+            }
+        }
     }
 
     async fn browse_loop(

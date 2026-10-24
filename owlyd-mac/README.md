@@ -22,11 +22,12 @@ iPhone sends: answer `o` to accept. Received files land in the directory
 you launched from, given back to your user (not root). Ctrl-C stops it
 and puts everything back.
 
-Requirements: the AirportItlwm kext of this repository (v2.5 or later
-for `done=`/`recycled=` in the stats; v2.4 still runs everything else,
-branch awdl-v2) loaded, and nothing else holding the radio. The
-self-signed identity persists in `/var/db/owlyd-mac`, so the phone keeps
-recognising the Mac between sessions.
+Requirements: the AirportItlwm kext of this repository (v2.6 or later
+for `fw_err=` in the stats — the gate's honest witness; v2.5 runs
+everything else but the gate judges on rx alone; branch awdl-v2)
+loaded, and nothing else holding the radio. The self-signed identity
+persists in `/var/db/owlyd-mac`, so the phone keeps recognising the Mac
+between sessions.
 
 ## Testing against an iPhone
 
@@ -38,11 +39,12 @@ recognising the Mac between sessions.
    sixteen, so give the announcement bursts ~15 s.
 3. What the log tells you, in order: `porte TX` climbing the ramp with
    rx moving at every step (the radio surviving our own emission),
-   `tx_multicast` growing (the engine carrying the announcements as AWDL
-   data frames), `— AirDrop : vu par [..]` (an iPhone's `/Discover`
-   answered — the name should be in its list), then the ask prompt when
-   someone taps. If `porte TX` says the radio died, the line names the
-   pace that killed it — that log is the next fix's brief.
+   `tx_multicast` growing (the engine carrying the announcements and the
+   mDNS replies as AWDL data frames), `— AirDrop : vu par [..]` (an
+   iPhone's `/Discover` answered — the name should be in its list), then
+   the ask prompt when someone taps. If `porte TX` says the radio died,
+   the line names the pace that killed it and what the firmware said
+   (`fw_err`, `fwid=`/`il1=`/`hcmd=`) — that log is the next fix's brief.
 
 ## Layout
 
@@ -50,9 +52,12 @@ recognising the Mac between sessions.
                           deviations in its driver: Running::stop waits at
                           most 2 s, and the engine loop publishes its
                           iteration count (a liveness heartbeat)
-    vendor/owly-airdrop   owly's AirDrop crate (MIT): the mDNS codec and
-                          responder, the TLS receiver (/Discover, /Ask,
-                          /Upload), the sandboxed extraction
+    vendor/owly-airdrop   owly's AirDrop crate (MIT); one documented
+                          deviation in its mDNS driver: an outbox lane for
+                          every egress, for a kernel that refuses to
+                          carry multicast off the utun — the codec, the
+                          TLS receiver (/Discover, /Ask, /Upload) and the
+                          sandboxed extraction are upstream's
     owlyd-mac             the daemon: sysctl bindings, the Air (a reader
                           thread over the kext's RX ring + a writer thread
                           for the injects), the utun Netif (a reader thread
@@ -106,6 +111,31 @@ errors out loud now). itlawdl v2.5 counts the inject queue's TX
 completions (`done=`) and the v2.4 slot take-backs (`recycled=`) — with
 `ok=` they say whether the firmware ever touched what we queued — and
 stops setting a pre-AX210 ACK bit the gen3 TX command reserves.
+
+The v08 run (kext v2.6, binding 1) settled it: ok=10, done=0, rx dead
+at the very first TFD, and fw_err=2 — the firmware's own error dumps.
+itlawdl v2.7 found the poison in the code: the inject path never set
+the TX command's rate byte on this firmware (VER_8), so every legacy
+frame ever injected left with rate_n_flags = antennas | a stack byte.
+A rate the PHY cannot honour takes the whole MAC down. v2.7 sets it
+(hwrate = the PLCP code; `txrate=` in the stats proves it in every
+log).
+
+v0.2.0 is the full-code audit's release. Beyond the kext's two safety
+fixes (v2.7.1: the stats buffer's length is clamped — a truncated
+snprintf could walk sysctl_handle_string past it — and awdlInject
+demands a live session), the daemon learned three things the audit
+found: the mDNS REPLIES to a phone's queries rode the socket path the
+v06 run proved dead (only the announcements had the direct lane — all
+egress rides it now: announcements, replies, goodbyes); the gate judged
+a quiet channel dead (the field's channel 6 runs at 5 frames in 12 s —
+a healthy radio can look silent for a window, so the verdict now needs
+the firmware's own word: `fw_err` cuts at once, and rx silence holds
+the step, twice in a row being the only rx-only death — a cut that
+hears rx again re-opens the ramp, thrice at most); and in free run
+nothing watched the firmware anymore (an error dump there now falls
+back to the last proven pace, and the monitor's line carries rx, and
+fw_err at every boundary).
 
 ## Credits
 
