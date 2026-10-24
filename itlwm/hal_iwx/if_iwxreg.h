@@ -3245,6 +3245,14 @@ struct iwx_time_event_notif {
 #define IWX_SESSION_PROTECTION_CMD      0x5
 #define IWX_SESSION_PROTECTION_NOTIF    0xFB
 
+/* itlawdl v2.8.5: the new MLD-API MAC_CONF_GROUP subcommands owly uses
+ * on this firmware (iwlmld). The commands are built as byte buffers to
+ * reproduce owly's captured bytes exactly (see
+ * docs/AWDL-INJECTION-FINDINGS.md). */
+#define IWX_MAC_CONFIG_CMD      0x8
+#define IWX_LINK_CONFIG_CMD     0x9
+#define IWX_STA_CONFIG_CMD      0xA
+
 #define IWX_SESSION_PROTECT_CONF_ASSOC  0
 #define IWX_SESSION_PROTECT_CONF_GO_CLIENT_ASSOC    1
 #define IWX_SESSION_PROTECT_CONF_P2P_DEVICE_DISCOV  2

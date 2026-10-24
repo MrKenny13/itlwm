@@ -7596,6 +7596,15 @@ awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type, int *tid)
         *sta_type = IWX_STA_GENERAL_PURPOSE;
         *tid = IWX_MAX_TID_COUNT;
         break;
+    case 10:
+        /* v2.8.5: the new-API (iwlmld) injection -- the whole setup is
+         * owly's command chain in iwx_awdl_mld_inject_setup; this just
+         * names the station for the stats (sta_id 2, bcast_mgmt, tid
+         * 15). The queue is TVQM-allocated there. */
+        *sta_id = 2;
+        *sta_type = IWX_STA_MULTICAST;  /* closest legacy name for stats */
+        *tid = IWX_MGMT_TID;
+        break;
     case 9:
         /* v2.8.4: binding 7's station (sta 0 LINK) but the inject
          * queue is allocated with the NEW SCD_QUEUE_CONFIG_CMD
@@ -9973,6 +9982,96 @@ iwx_phy_ctxt_update(struct iwx_softc *sc, struct iwx_phy_ctxt *phyctxt,
     return 0;
 }
 
+/* itlawdl v2.8.5: little-endian field writers for the byte-exact MLD
+ * command buffers. */
+static inline void awdl_le32p(uint8_t *b, uint32_t v)
+{
+    b[0] = v & 0xff; b[1] = (v >> 8) & 0xff;
+    b[2] = (v >> 16) & 0xff; b[3] = (v >> 24) & 0xff;
+}
+
+/* itlawdl v2.8.5: the new-API (iwlmld) injection setup, replicating
+ * owly's exact captured command bytes (docs/AWDL-INJECTION-FINDINGS.md),
+ * with our MAC and the AWDL BSSID substituted. The PHY context is the
+ * one iwx_auth already set up (phy_ctxt[0], phy_id 0). Sends:
+ *   MAC_CONFIG(ADD, mac_type 4) -> LINK_CONFIG(ADD, active, bi 10000,
+ *   AWDL BSSID) -> STA_CONFIG(sta 2, peer=BSSID, BCAST_MGMT) ->
+ *   SCD_QUEUE_CONFIG(ADD, sta_mask=BIT(2), tid 15) via TVQM.
+ * The inject queue id the firmware returns is stored for the inject
+ * and completion paths. */
+int ItlIwx::
+iwx_awdl_mld_inject_setup(struct iwx_softc *sc, struct iwx_node *in)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    static const uint8_t awdl_bssid[6] =
+        { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
+    uint8_t buf[208];
+    int err, q;
+
+    /* MAC_CONFIG_CMD (ADD). filter 0x2c is owly's; we add PROMISC(0x1)
+     * and CTRL+MGMT(0x2) so the host still sees the peer's AWDL frames
+     * (the daemon gates on rx>0 before injecting). */
+    memset(buf, 0, 52);
+    awdl_le32p(buf + 4, 1);               /* action = ADD */
+    awdl_le32p(buf + 8, 4);               /* mac_type = 4 */
+    IEEE80211_ADDR_COPY(buf + 12, ic->ic_myaddr);
+    awdl_le32p(buf + 20, 0x2c | 0x1 | 0x2); /* filter_flags */
+    awdl_le32p(buf + 32, 1);              /* nic_not_ack_enabled */
+    err = iwx_send_cmd_pdu(sc,
+        iwx_cmd_id(IWX_MAC_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0),
+        0, 52, buf);
+    if (err) { XYLog("itlawdl: MAC_CONFIG failed %d\n", err); return err; }
+
+    /* LINK_CONFIG_CMD (ADD, active). Rates/EDCA/bi/BSSID are owly's. */
+    {
+        static const uint8_t ac[4][8] = {
+            { 0x0f,0x00,0xff,0x03,0x07,0x02,0x00,0x00 },
+            { 0x0f,0x00,0xff,0x03,0x03,0x04,0x00,0x00 },
+            { 0x07,0x00,0x0f,0x00,0x02,0x08,0xc0,0x0b },
+            { 0x03,0x00,0x07,0x00,0x02,0x10,0xe0,0x05 },
+        };
+        memset(buf, 0, 208);
+        awdl_le32p(buf + 0, 1);           /* action = ADD */
+        awdl_le32p(buf + 4, 0);           /* link_id */
+        awdl_le32p(buf + 8, 0);           /* mac_id */
+        awdl_le32p(buf + 12, 0);          /* phy_id */
+        IEEE80211_ADDR_COPY(buf + 16, ic->ic_myaddr);
+        awdl_le32p(buf + 24, 0xff);       /* modify_mask = ALL */
+        awdl_le32p(buf + 28, 1);          /* active */
+        awdl_le32p(buf + 36, 0x0f);       /* cck_rates */
+        awdl_le32p(buf + 40, 0x15);       /* ofdm_rates */
+        awdl_le32p(buf + 52, 6);          /* protection_flags */
+        awdl_le32p(buf + 56, 3);          /* qos_flags */
+        memcpy(buf + 60, ac, sizeof(ac)); /* ac[0..3] */
+        awdl_le32p(buf + 136, 10000);     /* bi (TU) */
+        IEEE80211_ADDR_COPY(buf + 168, awdl_bssid);
+        err = iwx_send_cmd_pdu(sc,
+            iwx_cmd_id(IWX_LINK_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0),
+            0, 208, buf);
+        if (err) { XYLog("itlawdl: LINK_CONFIG failed %d\n", err); return err; }
+    }
+
+    /* STA_CONFIG_CMD: the bcast_mgmt injection station, sta_id 2. */
+    memset(buf, 0, 96);
+    awdl_le32p(buf + 0, 2);               /* sta_id = 2 */
+    awdl_le32p(buf + 4, 0);               /* link_id = 0 */
+    IEEE80211_ADDR_COPY(buf + 8, awdl_bssid);   /* peer_mld */
+    IEEE80211_ADDR_COPY(buf + 16, awdl_bssid);  /* peer_link */
+    awdl_le32p(buf + 24, 1);              /* station_type = BCAST_MGMT */
+    awdl_le32p(buf + 36, 1);              /* mfp */
+    err = iwx_send_cmd_pdu(sc,
+        iwx_cmd_id(IWX_STA_CONFIG_CMD, IWX_MAC_CONF_GROUP, 0),
+        0, 96, buf);
+    if (err) { XYLog("itlawdl: STA_CONFIG failed %d\n", err); return err; }
+
+    /* SCD_QUEUE_CONFIG (new API) via TVQM: sta_mask = BIT(2), tid 15. */
+    q = iwx_tvqm_alloc_txq(sc, IWX_MGMT_TID, 0, 1u << 2);
+    if (q < 0) { XYLog("itlawdl: MLD queue alloc failed %d\n", q); return EIO; }
+    sc->sc_awdl_inject_qid = q;
+    XYLog("itlawdl: MLD inject queue = %d (sta 2 bcast_mgmt tid 15)\n", q);
+    return 0;
+}
+
 int ItlIwx::
 iwx_auth(struct iwx_softc *sc)
 {
@@ -10018,7 +10117,19 @@ iwx_auth(struct iwx_softc *sc)
     }
     in->in_phyctxt = &sc->sc_phyctxt[0];
     IEEE80211_ADDR_COPY(in->in_macaddr, in->in_ni.ni_macaddr);
-    
+
+    /* itlawdl v2.8.5: binding 10 is the whole new-API (iwlmld) injection
+     * setup -- owly's exact command chain -- instead of the legacy
+     * MAC_CONTEXT/binding/ADD_STA. The PHY context above is reused. */
+    if (ic->ic_opmode == IEEE80211_M_MONITOR && sc->sc_awdl_tx_sta == 10) {
+        err = iwx_awdl_mld_inject_setup(sc, in);
+        if (err) {
+            XYLog("%s: MLD inject setup failed (%d)\n", DEVNAME(sc), err);
+            return err;
+        }
+        return 0;
+    }
+
     err = iwx_mac_ctxt_cmd(sc, in, IWX_FW_CTXT_ACTION_ADD, 0);
     if (err) {
         XYLog("%s: could not add MAC context (error %d)\n",

@@ -451,6 +451,7 @@ public:
     int    iwx_enable_mgmt_queue(struct iwx_softc *);
     int    iwx_phy_ctxt_update(struct iwx_softc *, struct iwx_phy_ctxt *,
                                struct ieee80211_channel *, uint8_t, uint8_t, uint32_t);
+    int    iwx_awdl_mld_inject_setup(struct iwx_softc *, struct iwx_node *);
     int    iwx_auth(struct iwx_softc *);
     int    iwx_deauth(struct iwx_softc *);
     int    iwx_run(struct iwx_softc *);

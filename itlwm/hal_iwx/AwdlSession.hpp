@@ -411,7 +411,7 @@ awdl_txsta_sysctl SYSCTL_HANDLER_ARGS
     int err = sysctl_handle_int(oidp, &v, 0, req);
     if (err || !req->newptr)
         return err;
-    if (v < 0 || v > 9)
+    if (v < 0 || v > 10)
         return EINVAL;
     /* takes effect at the next session start; the stats line says
      * which binding is live (txsta=). */
@@ -571,7 +571,7 @@ SYSCTL_PROC(_debug, OID_AUTO, itlawdl_cell, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_L
             "pin fw mac type for the next session: 0 auto (pibss), 4 ibss, 3 pibss, 2 listener");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_txsta, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_txsta_sysctl, "I",
-            "inject queue station binding: 0 monitor (v2.5), 1 sta0 LINK (default), 2 aux, 3 sta0 mcast (v2.7.2), 4 snif_sta tid 8 (v2.8), 5 sta0 gp bcast tid 15 (v2.8.1), 6 = 5 + session protection, 7 sta0 LINK via TVQM (v2.8.2), 8 = 7 + TLC rate-scaling (v2.8.3), 9 = new-API queue config SCD_QUEUE_CONFIG_CMD (v2.8.4) -- read at session start");
+            "inject queue station binding: 0 monitor (v2.5), 1 sta0 LINK (default), 2 aux, 3 sta0 mcast (v2.7.2), 4 snif_sta tid 8 (v2.8), 5 sta0 gp bcast tid 15 (v2.8.1), 6 = 5 + session protection, 7 sta0 LINK via TVQM (v2.8.2), 8 = 7 + TLC rate-scaling (v2.8.3), 9 = new-API queue config (v2.8.4), 10 = full new-API/iwlmld injection (v2.8.5) -- read at session start");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_notx, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_notx_sysctl, "I",
             "v2.8.1: 1 = hold injected frames before the TFD (the session without emission, kext-side; held= counts) -- read live");
