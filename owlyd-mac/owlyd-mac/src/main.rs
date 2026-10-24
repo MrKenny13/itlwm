@@ -384,7 +384,9 @@ fn bring_cell_up(wifi: &mut Wifi) -> io::Result<()> {
         if attempt >= 3 {
             return Err(io::Error::other(
                 "la radio reste muette (rx=0) après 3 essais. Envoie le journal du kext : \
-                 sudo log show --last 15m --predicate 'eventMessage contains \"itlawdl\"'",
+                 sudo log show --last 15m --predicate 'eventMessage contains \"itlwm\"' \
+                 (XYLog parle sous le nom \"itlwm\", pas \"itlawdl\" — et après un plantage \
+                 firmware, le dump complet est aussi dans sudo dmesg et /var/log/kernel.log)",
             ));
         }
         println!(
