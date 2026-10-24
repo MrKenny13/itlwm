@@ -6117,7 +6117,7 @@ iwx_rx_tx_ba_notif(struct iwx_softc *sc, struct iwx_rx_packet *pkt, struct iwx_r
             continue;
         /* itlawdl v2.5: the inject queue can complete through a BA
          * notification too; both doors count. */
-        if (qid == IWX_DQA_INJECT_MONITOR_QUEUE)
+        if (gAwdl.session && qid == sc->sc_awdl_inject_qid)
             gAwdl.inject_done++;
         ring = &sc->txq[qid];
 
@@ -6191,7 +6191,7 @@ iwx_rx_tx_cmd(struct iwx_softc *sc, struct iwx_rx_packet *pkt,
      * over, fifo, abort, ...) in the status word — keep the last one,
      * it separates "never scheduled" (done stays put) from
      * "scheduled and refused" (done_err climbs). */
-    if (qid == IWX_DQA_INJECT_MONITOR_QUEUE) {
+    if (gAwdl.session && qid == sc->sc_awdl_inject_qid) {
         gAwdl.inject_done++;
         if (tx_resp->frame_count == 1) {
             uint16_t st = le16toh(tx_resp->status.status);
@@ -7574,6 +7574,18 @@ awdl_tx_sta_shape(int sel, int *sta_id, int *sta_type, int *tid)
         *sta_type = IWX_STA_GENERAL_PURPOSE;
         *tid = IWX_MAX_TID_COUNT;
         break;
+    case 7:
+        /* v2.8.2: binding 1's station (sta 0 LINK, our MAC) but its
+         * queue is allocated through TVQM (iwx_tvqm_alloc_txq, the fw
+         * picks the qid) instead of the static SCD_QUEUE_CFG that binds
+         * a fixed qid 2. On gen3 mvm allocates every data-carrying queue
+         * this way; the static path is the one structural TX difference
+         * left once the station axis was ruled out (done=0 on all of
+         * 0..6). tid 8, the internal-station tid under TVQM. */
+        *sta_id = IWX_STATION_ID;
+        *sta_type = IWX_STA_LINK;
+        *tid = IWX_MAX_TID_COUNT;
+        break;
     case 5:
     case 6:
         /* v2.8.1: iwlwifi's bcast_sta -- the vif's broadcast station
@@ -7630,7 +7642,8 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
             IEEE80211_ADDR_COPY(&add_sta_cmd.addr,
                                 etheranyaddr);
         else if (ic->ic_opmode == IEEE80211_M_MONITOR &&
-                 (sc->sc_awdl_tx_sta == 3 || sc->sc_awdl_tx_sta >= 5))
+                 (sc->sc_awdl_tx_sta == 3 ||
+                  sc->sc_awdl_tx_sta == 5 || sc->sc_awdl_tx_sta == 6))
             /* v2.7.2 (binding 3) and v2.8.1 (bindings 5/6, the bcast
              * station): a broadcast station carries the broadcast. */
             IEEE80211_ADDR_COPY(&add_sta_cmd.addr,
@@ -9984,7 +9997,23 @@ iwx_auth(struct iwx_softc *sc)
          * station (awdl_tx_sta_shape). */
         int sid, stype, stid;
         awdl_tx_sta_shape(sc->sc_awdl_tx_sta, &sid, &stype, &stid);
+        if (sc->sc_awdl_tx_sta == 7) {
+            /* v2.8.2: let the fw allocate the queue (TVQM), the gen3
+             * way, instead of the static fixed qid 2. The returned qid
+             * is stored for the inject/completion paths. */
+            int q = iwx_tvqm_alloc_txq(sc, stid, 0);
+            if (q < 0) {
+                XYLog("itlawdl: TVQM inject queue alloc failed (%d)\n", q);
+                err = EIO;
+                goto rm_sta;
+            }
+            sc->sc_awdl_inject_qid = q;
+            XYLog("itlawdl: TVQM inject queue = %d (sta %d tid %d)\n",
+                  q, sid, stid);
+            return 0;
+        }
         /* v2.8: the tid is the binding's (8 for the snif_sta). */
+        sc->sc_awdl_inject_qid = IWX_DQA_INJECT_MONITOR_QUEUE;
         err = iwx_enable_txq(sc, sid,
                              IWX_DQA_INJECT_MONITOR_QUEUE, stid,
                              sc->txq[IWX_DQA_INJECT_MONITOR_QUEUE].ring_count);
@@ -14343,6 +14372,9 @@ awdlSessionSetGated(int target, int cell_wanted)
      * read here so a write between sessions takes effect on the next
      * one). */
     sc->sc_awdl_tx_sta = gAwdl.tx_sta_wanted;
+    /* v2.8.2: static-binding default; binding 7 overwrites it with the
+     * fw's TVQM pick in iwx_auth. */
+    sc->sc_awdl_inject_qid = IWX_DQA_INJECT_MONITOR_QUEUE;
     gAwdl.prot = 0;    /* v2.8.1: binding 6 sets it in iwx_auth */
     gAwdl.session = target;
     sc->sc_awdl_session = target;
@@ -14374,6 +14406,7 @@ awdlSessionSetGated(int target, int cell_wanted)
         gAwdl.tx_sta_id = sid;
         gAwdl.tx_sta_type = stype;
         gAwdl.tx_tid = stid;
+        gAwdl.tx_qid = sc->sc_awdl_inject_qid;
     }
     XYLog("itlawdl: %s session up (channel %d, fw mac type %d, inject sta %d)\n",
           target == 2 ? "cell" : "listen", AWDL_SESSION_CHANNEL, cell,
@@ -14453,7 +14486,7 @@ awdlInject(const uint8_t *req, size_t reqlen)
     if (frame_len < 10 || frame_len > AWDL_SESSION_MAX_FRAME ||
         reqlen != sizeof(*tr) + frame_len)
         return EINVAL;
-    if (!(sc->txq[IWX_DQA_INJECT_MONITOR_QUEUE].ring_count)) {
+    if (!(sc->txq[sc->sc_awdl_inject_qid].ring_count)) {
         gAwdl.inject_err++;
         return ENODEV;    /* no session, or the queue never came up */
     }
@@ -14638,7 +14671,7 @@ awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
     uint16_t num_tbs;
     uint8_t type;
     int totlen;
-    int qid = IWX_DQA_INJECT_MONITOR_QUEUE;
+    int qid = sc->sc_awdl_inject_qid;
     int idx;
 
     wh = mtod(m, struct ieee80211_frame *);

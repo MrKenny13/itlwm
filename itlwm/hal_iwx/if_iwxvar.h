@@ -718,6 +718,11 @@ struct iwx_softc {
 	 * monitor-injection shape).
 	 */
 	int sc_awdl_tx_sta;
+	/* v2.8.2: the inject queue id in use this session. Static bindings
+	 * (0..6) keep IWX_DQA_INJECT_MONITOR_QUEUE (2); binding 7 lets the
+	 * firmware pick one through TVQM and stores it here. The inject and
+	 * completion paths read this, not the constant. */
+	int sc_awdl_inject_qid;
 
 //	struct rwlock ioctl_rwl;
 

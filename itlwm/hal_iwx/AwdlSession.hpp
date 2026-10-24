@@ -112,6 +112,20 @@
 //  relaying another block's death, and the LMAC half usually names
 //  the real fault).
 //
+//  v2.8.2: the v2.8 field run (binding 4, mvm's exact snif_sta) died
+//  with the same assert as 1/2/3 and done=0 throughout -- the fw never
+//  completes a TX on the inject queue; the frame sits in the ring
+//  (queued=1) and the LMAC asserts (ADVANCED_SYSASSERT 0x103D, il
+//  0x4CF022, hcmd 0x8001FC12). The --sans-emission control ran clean
+//  (fw_err=0), so the context is innocent and transmitting on the
+//  static queue is the trigger. The bcast_sta (binding 5/6) attacks the
+//  station+protection axis; binding 7 attacks the remaining one, the
+//  queue. On gen3 mvm allocates every data-carrying queue through TVQM
+//  (iwl_trans_txq_alloc), never the static SCD_QUEUE_CFG the inject
+//  path binds a fixed qid 2 with. Binding 7 (debug.itlawdl_txsta=7) is
+//  binding 1's station (sta 0 LINK, our MAC) with its queue allocated
+//  through TVQM -- the fw picks the qid, named in the stats as qid=.
+//
 //  With Wi-Fi turned OFF in macOS, `sysctl -w debug.itlawdl=2` restarts
 //  the firmware as a "cell" on channel 6: a PIBSS MAC context (Intel's
 //  pseudo-IBSS; a plain IBSS one receives nothing on this firmware) on
@@ -244,6 +258,9 @@ struct awdl_session_state {
     int tx_sta_wanted;
     int tx_sta, tx_sta_id, tx_tid;
     int tx_sta_type;
+    /* v2.8.2: the inject queue id this session used -- 2 for the static
+     * bindings, the fw's TVQM pick for binding 7. Named in stats (qid=). */
+    int tx_qid;
     /* v2.8.1 knobs, never reset with the counters: notx_wanted is the
      * kext-side discriminator flag (debug.itlawdl_notx); prot says
      * what binding 6's session protection got -- 0 none requested,
@@ -391,7 +408,7 @@ awdl_txsta_sysctl SYSCTL_HANDLER_ARGS
     int err = sysctl_handle_int(oidp, &v, 0, req);
     if (err || !req->newptr)
         return err;
-    if (v < 0 || v > 6)
+    if (v < 0 || v > 7)
         return EINVAL;
     /* takes effect at the next session start; the stats line says
      * which binding is live (txsta=). */
@@ -426,7 +443,7 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         "awdl action=%llu psf=%llu mif=%llu other=%llu data=%llu data_bytes=%llu\n"
         "peer %02x:%02x:%02x:%02x:%02x:%02x rssi=%d\n"
         "inject ok=%llu err=%llu held=%llu bytes=%llu done=%llu recycled=%llu done_err=%llu last=0x%x txrate=0x%x\n"
-        "fw_err=%llu fwid=0x%x il1=0x%x hcmd=0x%x txsta=%d(sta %d type %s tid %d want %d%s)\n"
+        "fw_err=%llu fwid=0x%x il1=0x%x hcmd=0x%x txsta=%d(sta %d type %s tid %d qid %d want %d%s)\n"
         "umac id=0x%x il=0x%x d1=0x%x d2=0x%x d3=0x%x ch=0x%x\n"
         "lmac ld1=0x%x ld2=0x%x ld3=0x%x\n"
         "state=%d cell=%d(want %d) channel=%d prot=%d notx=%d\n",
@@ -445,7 +462,7 @@ awdl_stats_sysctl SYSCTL_HANDLER_ARGS
         (unsigned)gAwdl.fw_err_il1, (unsigned)gAwdl.fw_err_hcmd,
         gAwdl.tx_sta, gAwdl.tx_sta_id,
         awdl_sta_type_name(gAwdl.tx_sta_type),
-        gAwdl.tx_tid, gAwdl.tx_sta_wanted,
+        gAwdl.tx_tid, gAwdl.tx_qid, gAwdl.tx_sta_wanted,
         gAwdl.prot > 0 ? " prot" : "",
         (unsigned)gAwdl.fw_err_u_id, (unsigned)gAwdl.fw_err_u_il1,
         (unsigned)gAwdl.fw_err_u_d1, (unsigned)gAwdl.fw_err_u_d2,
@@ -551,7 +568,7 @@ SYSCTL_PROC(_debug, OID_AUTO, itlawdl_cell, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_L
             "pin fw mac type for the next session: 0 auto (pibss), 4 ibss, 3 pibss, 2 listener");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_txsta, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_txsta_sysctl, "I",
-            "inject queue station binding: 0 monitor (v2.5), 1 sta0 LINK (default), 2 aux, 3 sta0 mcast (v2.7.2), 4 snif_sta tid 8 (v2.8), 5 sta0 gp bcast tid 15 (v2.8.1), 6 = 5 + session protection -- read at session start");
+            "inject queue station binding: 0 monitor (v2.5), 1 sta0 LINK (default), 2 aux, 3 sta0 mcast (v2.7.2), 4 snif_sta tid 8 (v2.8), 5 sta0 gp bcast tid 15 (v2.8.1), 6 = 5 + session protection, 7 sta0 LINK via TVQM (v2.8.2) -- read at session start");
 SYSCTL_PROC(_debug, OID_AUTO, itlawdl_notx, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, awdl_notx_sysctl, "I",
             "v2.8.1: 1 = hold injected frames before the TFD (the session without emission, kext-side; held= counts) -- read live");
@@ -576,6 +593,7 @@ awdl_session_attach(void)
         gAwdlRingLock = IOSimpleLockAlloc();
     if (!gAwdlSysctlRegistered) {
         gAwdl.tx_sta_wanted = 1;    /* v2.6 default: the STA-mode shape */
+        gAwdl.tx_qid = 2;           /* v2.8.2: default before any session */
         sysctl_register_oid(&sysctl__debug_itlawdl);
         sysctl_register_oid(&sysctl__debug_itlawdl_cell);
         sysctl_register_oid(&sysctl__debug_itlawdl_txsta);
