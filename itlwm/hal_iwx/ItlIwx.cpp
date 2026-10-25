@@ -3476,16 +3476,9 @@ iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
     }
     
     resp = (struct iwx_tx_queue_cfg_rsp *)pkt->data;
-    if (new_sta_mask)
-        XYLog("itlawdl: MLD queue response mask=0x%x tid=%d "
-              "qid=%u flags=0x%x wrptr=%u slots=%u\n",
-              new_sta_mask, tid, (unsigned int)le16toh(resp->queue_number),
-              (unsigned int)le16toh(resp->flags),
-              (unsigned int)le16toh(resp->write_pointer),
-              (unsigned int)ring->ring_count);
     fwqid = le16toh(resp->queue_number);
     wr_idx = le16toh(resp->write_pointer);
-    
+
     /* Unlike iwlwifi, we do not support dynamic queue ID assignment. */
     if (fwqid != qid) {
         DPRINTF(("requested qid %d but %d was assigned\n", qid, fwqid));
@@ -3686,6 +3679,13 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size,
     }
 
     resp = (struct iwx_tx_queue_cfg_rsp *)pkt->data;
+    if (new_sta_mask)
+        XYLog("itlawdl: MLD queue response mask=0x%x tid=%d "
+              "qid=%u flags=0x%x wrptr=%u slots=%u\n",
+              new_sta_mask, tid, (unsigned int)le16toh(resp->queue_number),
+              (unsigned int)le16toh(resp->flags),
+              (unsigned int)le16toh(resp->write_pointer),
+              (unsigned int)ring->ring_count);
     fwqid = le16toh(resp->queue_number);
     wr_idx = le16toh(resp->write_pointer);
     if (fwqid >= ARRAY_SIZE(sc->txq)) {
