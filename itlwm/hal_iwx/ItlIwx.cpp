@@ -3476,6 +3476,13 @@ iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
     }
     
     resp = (struct iwx_tx_queue_cfg_rsp *)pkt->data;
+    if (new_sta_mask)
+        XYLog("itlawdl: MLD queue response mask=0x%x tid=%d "
+              "qid=%u flags=0x%x wrptr=%u slots=%u\n",
+              new_sta_mask, tid, (unsigned int)le16toh(resp->queue_number),
+              (unsigned int)le16toh(resp->flags),
+              (unsigned int)le16toh(resp->write_pointer),
+              (unsigned int)ring->ring_count);
     fwqid = le16toh(resp->queue_number);
     wr_idx = le16toh(resp->write_pointer);
     
@@ -10186,6 +10193,29 @@ iwx_awdl_mld_inject_setup(struct iwx_softc *sc, struct iwx_node *in)
     int err, q, n;
     (void)in;
 
+    /* MLD firmware API support is a capability, not an opcode probe.
+     * Linux fw/file.h assigns MLD_API_SUPPORT capability bit 110.
+     * The captured RLC payloads are specifically the version-2 ABI. */
+    const unsigned int mld_capa_bit = 110;
+    const bool has_mld_api =
+        mld_capa_bit < sizeof(sc->sc_enabled_capa) * NBBY &&
+        isset(sc->sc_enabled_capa, mld_capa_bit);
+    const uint8_t rlc_ver = iwx_lookup_cmd_ver(sc, 0x5, 0x8);
+    XYLog("itlawdl: MLD preflight fw=%s capa110=%u "
+          "mac=%u link=%u sta=%u scd=%u rlc=%u phy=%u tx=%u\n",
+          sc->sc_fwver, (unsigned int)has_mld_api,
+          (unsigned int)iwx_lookup_cmd_ver(sc, 0x3, 0x8),
+          (unsigned int)iwx_lookup_cmd_ver(sc, 0x3, 0x9),
+          (unsigned int)iwx_lookup_cmd_ver(sc, 0x3, 0xa),
+          (unsigned int)iwx_lookup_cmd_ver(sc, 0x5, 0x17),
+          (unsigned int)rlc_ver,
+          (unsigned int)iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_PHY_CONTEXT_CMD),
+          (unsigned int)iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_TX_CMD));
+    if (!has_mld_api || rlc_ver != 2) {
+        XYLog("itlawdl: MLD capture ABI unsupported; no replay sent\n");
+        return EOPNOTSUPP;
+    }
+
     /* v2.8.8: the firmware rejects MAC_CONFIG (BAD_COMMAND) unless a PHY
      * context already exists, so set up itlwm's phy 0 on channel 6
      * first (this is what v2.8.6 did before the MLD branch, where
@@ -10195,14 +10225,14 @@ iwx_awdl_mld_inject_setup(struct iwx_softc *sc, struct iwx_node *in)
                               1, 1, 0);
     if (err) { XYLog("itlawdl: MLD phy ctxt failed %d\n", err); return err; }
 
-#define MLD_SEND(TMPL, GRP, OP) do { \
+#define MLD_SEND(TMPL, GRP, OP, VER) do { \
     n = mld_patch(buf, mld_##TMPL, (int)sizeof(mld_##TMPL), mymac); \
-    err = iwx_send_cmd_pdu(sc, iwx_cmd_id((OP), (GRP), 0), 0, (uint16_t)n, buf); \
+    err = iwx_send_cmd_pdu(sc, iwx_cmd_id((OP), (GRP), (VER)), 0, (uint16_t)n, buf); \
     if (err) { XYLog("itlawdl: MLD " #TMPL " failed %d\n", err); return err; } \
 } while (0)
 
-    MLD_SEND(mac_add,   0x3, 0x8);     /* owly idx 82 */
-    MLD_SEND(link_add,  0x3, 0x9);     /* owly idx 83 */
+    MLD_SEND(mac_add,   0x3, 0x8, 0);     /* owly idx 82 */
+    MLD_SEND(link_add,  0x3, 0x9, 0);     /* owly idx 83 */
     /* v2.8.9: owly idx 85 -- it re-touches phy 0 (MODIFY, ch6) right
      * after the link is added. We previously only did phy ctxt once,
      * before mac_add, and never again. The capture shows two more phy
@@ -10210,9 +10240,9 @@ iwx_awdl_mld_inject_setup(struct iwx_softc *sc, struct iwx_node *in)
     err = iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[0], ic->ic_ibss_chan,
                               1, 1, 0);
     if (err) { XYLog("itlawdl: MLD phy re-touch(a) failed %d\n", err); return err; }
-    MLD_SEND(rlc1,      0x5, 0x8);     /* owly idx 86 */
-    MLD_SEND(link_mod1, 0x3, 0x9);     /* owly idx 87 */
-    MLD_SEND(link_mod2, 0x3, 0x9);     /* owly idx 88 */
+    MLD_SEND(rlc1,      0x5, 0x8, 2);     /* owly idx 86 */
+    MLD_SEND(link_mod1, 0x3, 0x9, 0);     /* owly idx 87 */
+    MLD_SEND(link_mod2, 0x3, 0x9, 0);     /* owly idx 88 */
     /* v2.8.9: owly idx 89 -- a LONG 0x9f (reduce-tx-power, "no
      * reduction"). Non-fatal: logged and survived like prot/tlc. */
     {
@@ -10229,19 +10259,19 @@ iwx_awdl_mld_inject_setup(struct iwx_softc *sc, struct iwx_node *in)
     err = iwx_phy_ctxt_update(sc, &sc->sc_phyctxt[0], ic->ic_ibss_chan,
                               1, 1, 0);
     if (err) { XYLog("itlawdl: MLD phy re-touch(b) failed %d\n", err); return err; }
-    MLD_SEND(rlc2,      0x5, 0x8);     /* owly idx 91 */
-    MLD_SEND(beacon,    0x1, 0x91);    /* owly idx 92 */
-    MLD_SEND(link_mod3, 0x3, 0x9);
-    MLD_SEND(sta_mcast, 0x3, 0xa);
+    MLD_SEND(rlc2,      0x5, 0x8, 2);     /* owly idx 91 */
+    MLD_SEND(beacon,    0x1, 0x91, 0);    /* owly idx 92 */
+    MLD_SEND(link_mod3, 0x3, 0x9, 0);
+    MLD_SEND(sta_mcast, 0x3, 0xa, 0);
     /* mcast station queue: sta_mask BIT(1), tid 0 */
     q = iwx_tvqm_alloc_txq(sc, 0, 0, 1u << 1);
     if (q < 0) { XYLog("itlawdl: MLD mcast queue failed %d\n", q); return EIO; }
-    MLD_SEND(sta_bcast, 0x3, 0xa);
+    MLD_SEND(sta_bcast, 0x3, 0xa, 0);
     /* injection station queue: sta_mask BIT(2), tid 15 */
     q = iwx_tvqm_alloc_txq(sc, IWX_MGMT_TID, 0, 1u << 2);
     if (q < 0) { XYLog("itlawdl: MLD inject queue failed %d\n", q); return EIO; }
     sc->sc_awdl_inject_qid = q;
-    MLD_SEND(link_mod4, 0x3, 0x9);
+    MLD_SEND(link_mod4, 0x3, 0x9, 0);
     XYLog("itlawdl: MLD replay done, inject queue = %d\n", q);
     return 0;
 #undef MLD_SEND
@@ -14827,6 +14857,7 @@ awdlInject(const uint8_t *req, size_t reqlen)
     const uint8_t *frame = req + sizeof(*tr);
     size_t frame_len;
     mbuf_t m;
+    int qid = sc->sc_awdl_inject_qid;
 
     if (reqlen < sizeof(*tr) + 10)
         return EINVAL;
@@ -14834,7 +14865,11 @@ awdlInject(const uint8_t *req, size_t reqlen)
     if (frame_len < 10 || frame_len > AWDL_SESSION_MAX_FRAME ||
         reqlen != sizeof(*tr) + frame_len)
         return EINVAL;
-    if (!(sc->txq[sc->sc_awdl_inject_qid].ring_count)) {
+    if ((tr->flags & 0x02) &&
+        (tr->rate & 0x1f) >= ARRAY_SIZE(iwx_mcs2ridx))
+        return EINVAL;
+    if (qid < 0 || qid >= (int)ARRAY_SIZE(sc->txq) ||
+        sc->txq[qid].ring_count == 0) {
         gAwdl.inject_err++;
         return ENODEV;    /* no session, or the queue never came up */
     }
@@ -14960,7 +14995,8 @@ awdlRxHook(mbuf_t m, int chanidx, uint32_t rx_pkt_status,
     gAwdl.rx_bytes += len;
 
     /* classify, v1 style */
-    is_awdl = (memcmp(wh->i_addr3, kAwdlSessBssid, 6) == 0);
+    is_awdl = (len >= sizeof(struct ieee80211_frame) &&
+               memcmp(wh->i_addr3, kAwdlSessBssid, 6) == 0);
     type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
     subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
     if (is_awdl) {
@@ -15022,12 +15058,30 @@ awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
     int qid = sc->sc_awdl_inject_qid;
     int idx;
 
+    if (qid < 0 || qid >= (int)ARRAY_SIZE(sc->txq)) {
+        mbuf_freem(m);
+        return ENODEV;
+    }
+    /* AWDL injects management/data frames. Check the complete header
+     * before rate selection, header copies, or mbuf_adj(). */
+    totlen = mbuf_pkthdr_len(m);
+    if (totlen < (int)sizeof(struct ieee80211_frame) ||
+        mbuf_len(m) < sizeof(struct ieee80211_frame)) {
+        mbuf_freem(m);
+        return EINVAL;
+    }
     wh = mtod(m, struct ieee80211_frame *);
     type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
-    if (type == IEEE80211_FC0_TYPE_CTL)
-        hdrlen = sizeof(struct ieee80211_frame_min);
-    else
-        hdrlen = ieee80211_get_hdrlen(wh);
+    if (type != IEEE80211_FC0_TYPE_MGT &&
+        type != IEEE80211_FC0_TYPE_DATA) {
+        mbuf_freem(m);
+        return EINVAL;
+    }
+    hdrlen = ieee80211_get_hdrlen(wh);
+    if (hdrlen > (u_int)totlen || hdrlen > mbuf_len(m)) {
+        mbuf_freem(m);
+        return EINVAL;
+    }
 
     ring = &sc->txq[qid];
     if (ring->ring_count == 0) {
@@ -15036,30 +15090,11 @@ awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
     }
     idx = (ring->cur & (ring->ring_count - 1));
     if (ring->data[idx].m) {
-        /* v2.4: this queue's completions never come back on this
-         * firmware (observed on the AX211: 330 TFDs taken, then
-         * ENOBUFS forever while the engine kept handing frames at
-         * 24/s -- the Mac went radio-silent ~14 s into the session).
-         * A slot is only reached again after a full turn of the ring,
-         * which at that pace is ~14 s after its TFD was kicked; the
-         * firmware read it long before. Take the slot back: free the
-         * mbuf, clear the descriptor, run on.
-         * v2.5: every take-back is counted now (inject_recycled) —
-         * how much of the session rode on recycled slots, said.
-         * v2.6: each queued frame owes the node reference its
-         * completion releases (awdlInject took one); a slot taken
-         * back early pays it here, the way iwx_txd_done would. */
-        mbuf_freem(ring->data[idx].m);
-        ring->data[idx].m = NULL;
-        if (ring->data[idx].in) {
-            ieee80211_release_node(&sc->sc_ic,
-                                   &ring->data[idx].in->in_ni);
-            ring->data[idx].in = NULL;
-        }
-        iwx_clear_tx_desc(sc, ring, idx);
-        if (ring->queued > 0)
-            ring->queued--;
-        gAwdl.inject_recycled++;
+        /* Time elapsed is not evidence of DMA completion. Keep the
+         * outstanding descriptor and its node reference untouched.
+         * Only a completion or a quiesced-device reset may reclaim it. */
+        mbuf_freem(m);
+        return ENOBUFS;
     }
     desc = &ring->desc[idx];
     memset(desc, 0, sizeof(*desc));
