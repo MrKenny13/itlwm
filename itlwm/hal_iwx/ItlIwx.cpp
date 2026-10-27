@@ -3697,9 +3697,37 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size,
         goto fail;
     }
 #ifdef AIRPORT_VTD
-    if (fwqid <= sc->first_data_qid || sc->txq[fwqid].queued || wr_idx >= getTxQueueSize()) {
-        err = -EIO;
-        goto fail;
+    {
+        const uint8_t add_sta_ver =
+            iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_ADD_STA);
+        /* With ADD_STA >= 12, iwx_add_aux_sta() creates neither the
+         * auxiliary station nor queue 1. Only the legacy AWDL TVQM
+         * experiment may reuse that otherwise reserved queue. */
+        const bool awdl_aux_unused =
+            sc->sc_ic.ic_opmode == IEEE80211_M_MONITOR &&
+            sc->sc_awdl_session == 2 && sc->sc_awdl_tx_sta == 7 &&
+            new_sta_mask == 0 && fwqid == IWX_DQA_AUX_QUEUE &&
+            add_sta_ver != IWX_FW_CMD_VER_UNKNOWN && add_sta_ver >= 12;
+        bool occupied = sc->txq[fwqid].queued != 0;
+        if (awdl_aux_unused) {
+            for (unsigned int j = 0; j < sc->txq[fwqid].ring_count; j++)
+                if (sc->txq[fwqid].data[j].m ||
+                    (sc->txq[fwqid].data[j].flags & IWX_TXDATA_FLAG_CMD_PENDING))
+                    occupied = true;
+        }
+        const bool reserved =
+            fwqid == IWX_DQA_CMD_QUEUE ||
+            (fwqid <= sc->first_data_qid && !awdl_aux_unused);
+        if (sc->sc_ic.ic_opmode == IEEE80211_M_MONITOR)
+            XYLog("itlawdl: TXDIAG TVQM response qid=%d wrptr=%u "
+                  "first=%d addsta=%u aux_unused=%u occupied=%u reserved=%u\n",
+                  fwqid, (unsigned int)wr_idx, sc->first_data_qid,
+                  (unsigned int)add_sta_ver, (unsigned int)awdl_aux_unused,
+                  (unsigned int)occupied, (unsigned int)reserved);
+        if (reserved || occupied || wr_idx >= getTxQueueSize()) {
+            err = -EIO;
+            goto fail;
+        }
     }
 #endif
     ring->cur = wr_idx;
@@ -10273,8 +10301,9 @@ iwx_awdl_mld_inject_setup(struct iwx_softc *sc, struct iwx_node *in)
     /* injection station queue: sta_mask BIT(2), tid 15 */
     q = iwx_tvqm_alloc_txq(sc, IWX_MGMT_TID, 0, 1u << 2);
     if (q < 0) { XYLog("itlawdl: MLD inject queue failed %d\n", q); return EIO; }
-    sc->sc_awdl_inject_qid = q;
     MLD_SEND(link_mod4, 0x3, 0x9, 0);
+    sc->sc_awdl_inject_qid = q;
+    gAwdl.tx_qid = q;
     XYLog("itlawdl: MLD replay done, inject queue = %d\n", q);
     return 0;
 #undef MLD_SEND
@@ -10295,6 +10324,12 @@ iwx_auth(struct iwx_softc *sc)
     /* itlawdl v2.8.5: binding 10 replays owly's full MLD injection
      * bring-up (its own PHY/MAC/LINK/STA/queue), so it skips ALL the
      * legacy setup below -- phy ctxt, mac ctxt, binding, add_sta. */
+    if (ic->ic_opmode == IEEE80211_M_MONITOR) {
+        /* enable() starts an asynchronous transition, so its return value
+         * does not prove that authentication and TX queue setup completed. */
+        sc->sc_awdl_inject_qid = -1;
+        gAwdl.tx_qid = -1;
+    }
     if (ic->ic_opmode == IEEE80211_M_MONITOR && sc->sc_awdl_tx_sta == 10) {
         err = iwx_awdl_mld_inject_setup(sc, in);
         if (err)
@@ -10378,6 +10413,7 @@ iwx_auth(struct iwx_softc *sc)
                 goto rm_sta;
             }
             sc->sc_awdl_inject_qid = q;
+            gAwdl.tx_qid = q;
             XYLog("itlawdl: TVQM inject queue = %d (sta %d tid %d)\n",
                   q, sid, stid);
             if (sc->sc_awdl_tx_sta == 8) {
@@ -10393,12 +10429,13 @@ iwx_auth(struct iwx_softc *sc)
             return 0;
         }
         /* v2.8: the tid is the binding's (8 for the snif_sta). */
-        sc->sc_awdl_inject_qid = IWX_DQA_INJECT_MONITOR_QUEUE;
         err = iwx_enable_txq(sc, sid,
                              IWX_DQA_INJECT_MONITOR_QUEUE, stid,
                              sc->txq[IWX_DQA_INJECT_MONITOR_QUEUE].ring_count);
         if (err)
             goto rm_sta;
+        sc->sc_awdl_inject_qid = IWX_DQA_INJECT_MONITOR_QUEUE;
+        gAwdl.tx_qid = sc->sc_awdl_inject_qid;
         /* itlawdl v2.8.1: binding 6 adds the one thing the working
          * STA path does that this branch always skipped -- a session
          * protection (this fw advertises CAPA SESSION_PROT_CMD). The
@@ -14752,9 +14789,9 @@ awdlSessionSetGated(int target, int cell_wanted)
      * read here so a write between sessions takes effect on the next
      * one). */
     sc->sc_awdl_tx_sta = gAwdl.tx_sta_wanted;
-    /* v2.8.2: static-binding default; binding 7 overwrites it with the
-     * fw's TVQM pick in iwx_auth. */
-    sc->sc_awdl_inject_qid = IWX_DQA_INJECT_MONITOR_QUEUE;
+    /* No usable injection queue until iwx_auth completes its setup. */
+    sc->sc_awdl_inject_qid = -1;
+    gAwdl.tx_qid = -1;
     gAwdl.prot = 0;    /* v2.8.1: binding 6 sets it in iwx_auth */
     gAwdl.tlc = 0;     /* v2.8.3: binding 8 sets it in iwx_auth */
     gAwdl.session = target;
@@ -14807,6 +14844,8 @@ awdlSessionLeaveGated()
         return;
     gAwdl.session = 0;
     sc->sc_awdl_session = 0;
+    sc->sc_awdl_inject_qid = -1;
+    gAwdl.tx_qid = -1;
     sc->sc_awdl_cell = 0;
     disable(NULL);
     ic->ic_opmode = IEEE80211_M_STA;
