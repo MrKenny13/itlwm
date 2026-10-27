@@ -3492,6 +3492,9 @@ iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
         goto out;
     }
 out:
+    if (sc->sc_ic.ic_opmode == IEEE80211_M_MONITOR)
+        XYLog("itlawdl: TXDIAG queue setup sta=%d tid=%d qid=%d "
+              "slots=%d result=%d\n", sta_id, tid, qid, num_slots, err);
     iwx_free_resp(sc, &hcmd);
     return err;
 }
@@ -14884,6 +14887,12 @@ awdlInject(const uint8_t *req, size_t reqlen)
         gAwdl.inject_err++;
         return ENXIO;
     }
+    /* Once a firmware error is observed, this session cannot safely
+     * submit more descriptors. A new session resets the error counters. */
+    if (gAwdl.fw_err != 0) {
+        gAwdl.inject_err++;
+        return EIO;
+    }
     /* v2.8.1: the discriminator, kext-side (the daemon's
      * --sans-emission is the same experiment one layer up: there the
      * write never reaches us). debug.itlawdl_notx holds the frame
@@ -15229,6 +15238,28 @@ awdlTxInject(struct iwx_softc *sc, mbuf_t m, struct iwx_node *in,
         desc->tbs[i + 2].tb_len = htole16(seg->length);
         paddr = htole64(seg->location);
         memcpy(&desc->tbs[i + 2].addr, &paddr, sizeof(paddr));
+    }
+
+    /* Capture the first submission only, before ringing the doorbell.
+     * Do not dump payloads or physical DMA addresses. */
+    if (gAwdl.inject_ok == 0) {
+        XYLog("itlawdl: TXDIAG fw=%s family=%u txver=%u binding=%d "
+              "qid=%d idx=%d slots=%d queued=%d len=%d hdrlen=%u "
+              "cmdsize=%u flags=0x%x rate=0x%x offload=0x%x tbs=%u\n",
+              sc->sc_fwname, (unsigned int)sc->sc_device_family,
+              (unsigned int)iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_TX_CMD),
+              sc->sc_awdl_tx_sta, ring->qid, idx, ring->ring_count,
+              ring->queued, totlen, hdrlen, (unsigned int)cmd_size,
+              (unsigned int)flags, (unsigned int)le32toh(rate_n_flags),
+              (unsigned int)offload_assist, (unsigned int)num_tbs);
+        for (unsigned int j = 0; j < cmd_size; j += 4) {
+            const uint8_t *b = (const uint8_t *)cmd->data + j;
+            XYLog("itlawdl: TXDIAG cmd[%u]=%02x %02x %02x %02x\n",
+                  j, b[0], b[1], b[2], b[3]);
+        }
+        for (unsigned int j = 0; j < num_tbs; j++)
+            XYLog("itlawdl: TXDIAG tb[%u] len=%u\n",
+                  j, (unsigned int)le16toh(desc->tbs[j].tb_len));
     }
 
     iwx_tx_update_byte_tbl(sc, ring, idx, totlen, num_tbs);
